@@ -32,11 +32,29 @@ QwenPaw Node（Android 客户端）的配套插件，为客户端补上核心 AP
 
 ## 安装
 
+安装包挂在 [Releases](https://github.com/csdeTR/QwenPaw-Node-Bridge/releases) 下，
+资产名固定为 `qwenpaw-node-bridge.zip`，因此链接有两种写法：
+
+- 最新版：`https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/latest/download/qwenpaw-node-bridge.zip`
+- 指定版本：`https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/download/v0.1.3/qwenpaw-node-bridge.zip`
+
+在 QwenPaw 的 Web 控制台「插件」页填写上面的地址即可安装，也可以在命令行安装：
+
 ```bash
-zip -r qwenpaw-node-bridge-0.1.3.zip plugin.json backend
-~/.qwenpaw/venv/bin/qwenpaw plugin validate qwenpaw-node-bridge-0.1.3.zip
-~/.qwenpaw/venv/bin/qwenpaw plugin install qwenpaw-node-bridge-0.1.3.zip
+~/.qwenpaw/venv/bin/qwenpaw plugin install \
+  https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/latest/download/qwenpaw-node-bridge.zip
 ```
+
+从源码打包时，在仓库根目录执行：
+
+```bash
+zip -r -X qwenpaw-node-bridge.zip plugin.json backend -x 'backend/__pycache__/*'
+~/.qwenpaw/venv/bin/qwenpaw plugin validate .
+~/.qwenpaw/venv/bin/qwenpaw plugin install qwenpaw-node-bridge.zip
+```
+
+`plugin validate` 接受的是目录，不是 zip；从源码校验时直接传仓库根目录。
+`__pycache__` 不进包，它是本地运行留下的字节码缓存。
 
 安装后重启 QwenPaw 服务端，再请求自述端点：
 
