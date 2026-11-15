@@ -25,6 +25,7 @@ QwenPaw Node（Android 客户端）的配套插件，为客户端补上核心 AP
 | v0.1.3 | 无新增端点；`/search` 的 `chat_id` 字段更正为 `session_id` | — |
 | v0.2.0（计划） | `/portability/*` | `portability` |
 | v0.3.0（计划） | 离线推送 channel | `push` |
+| v0.4.0（计划） | `WS /ssh`（二进制帧中继）、`GET /ssh/config`、`GET/PUT /ssh/settings`，控制台设置面板 `ui/index.js` | `ssh` |
 
 **客户端只按 `capabilities` 里的名字开关功能，不比对版本号。** `plugin_version`
 只用于展示与排查。v0.1.3 的字段改名不改变 `capabilities`，但会改变 `/search`
@@ -123,6 +124,78 @@ data: {"pending":1}
 
 **不包含定时任务。** `CronManager` 按 workspace 隔离，取摘要需要请求上下文里的智能体
 标识，而事件生成器里没有 `Request`。客户端的定时任务仍走轮询。
+
+## v0.4.0 计划：SSH 通道与控制台设置
+
+给 QwenPaw Node 的终端页补第二个来源：客户端通过一条 WebSocket 中继，在插件上跑标准 SSH。
+服务端本地 PTY 只能连服务端自己，且渲染依赖客户端自己写的 VT 子集；
+SSH 拿到的是真正的 `xterm-256color` PTY，还能连服务端**可到达的其它主机**。
+
+### 为什么是 WebSocket，不是裸 TCP
+
+裸 TCP 要在服务端另开一个端口，而实际部署通常只暴露 8088，反向代理不会转发第二个端口。
+WebSocket 走同一个 8088，`Upgrade` 之后就是全双工字节流，足够承载 SSH。
+
+宿主挂载插件的路径是 `api.register_http_router(router, prefix=...)` →
+`plugins/registry.py` 的 `_mount_plugin_http_on_app` → `app.include_router(...)`。
+FastAPI 的 `include_router` 保留 `APIWebSocketRoute`，因此 `@router.websocket("/ssh")`
+会挂到 `/api/plugins/qwenpaw-node-bridge/ssh`。
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| WS | `/ssh` | 二进制帧中继到配置好的目标；连接时校验令牌 |
+| GET | `/ssh/config` | 脱敏后的连接信息，给客户端读 |
+| GET / PUT | `/ssh/settings` | 控制台读写完整设置（私钥只写不读） |
+
+`GET /ssh/config` 的响应：
+
+```json
+{"host": "127.0.0.1", "port": 22, "user": "csdetr",
+ "auth": "key", "key_configured": true, "key_source": "file"}
+```
+
+私钥内容与口令**永不回传**，只回 `key_configured`。
+
+### 控制台设置面板
+
+`plugin.json` 增加 `entry.frontend: "ui/index.js"`，Console 通过
+`GET /api/frontend_plugin/{plugin_id}/files/ui/index.js` 动态 import 这个 ESM 模块，
+宿主提供 `window.QwenPaw.host.React` 与 `antd`。
+
+面板字段：
+
+| 项 | 类型 | 说明 |
+| --- | --- | --- |
+| 地址 | 文本 | 默认 `127.0.0.1` |
+| 端口 | 数字 | 默认 22 |
+| 用户名 | 文本 | 登录名 |
+| 认证方式 | 单选 | 密钥 / 密码 |
+| 私钥来源 | 单选 | 服务端已有路径（推荐）/ 粘贴私钥 |
+| 私钥 | 多行 | 仅「粘贴」方式出现，落盘 `0600` |
+| 口令 | 密码 | 只写不读 |
+
+**优先「服务端已有路径」**：私钥本来就在服务器上时，再复制一份进插件目录只是多一个泄漏点。
+粘贴方式用于没有现成密钥的场景，落盘必须 `0600`，且不写日志、不进备份。
+
+### 安全约束（不是建议）
+
+1. **WS 必须自己校验令牌。** `AuthMiddleware` 继承 `BaseHTTPMiddleware`
+   （`app/auth.py:724`），Starlette 这个基类只包裹 HTTP 作用域，**看不到 WebSocket**。
+   HTTP 那层的登录态对 WS 完全无效，漏校验就是一个匿名可达的 SSH 跳板。
+2. **默认只允许 `127.0.0.1:22`。** 改成其它主机等于把插件变成跳板，界面要明确提示；
+   并发连接数设上限。
+3. **主机密钥不得自动接受。** 首次连接走 TOFU，用户确认指纹后才记住。
+4. **私钥与口令只写不读**，端点不回传，日志不打印。
+
+### 客户端契约
+
+客户端在终端页给出二选一：服务端终端 / SSH 连接。**未装本插件或插件低于 v0.4.0 时，
+SSH 项置灰并给出安装地址**，不隐藏。选中 SSH 后先读 `GET /ssh/config`，
+`key_configured: false` 时引导用户去控制台补配置。
+
+---
 
 ## 三条加载器约束
 
