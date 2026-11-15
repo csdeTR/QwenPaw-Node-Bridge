@@ -1,19 +1,10 @@
 # QwenPaw Node Bridge
 
-QwenPaw Node（Android 客户端）的配套插件，为客户端补上核心 API 没有提供的端点。
+QwenPaw Node（Android 客户端）的配套插件，为客户端补上核心 API 没有提供的能力。
 
 插件与客户端是**两个独立仓库**，版本号各自编号：插件从 v0.1.0 起，与客户端版本
 不一一对应。两端之间只有「端点路径 + 响应形状」这一层契约，记录在客户端仓库的
 `docs/protocol.md` 第 24 节。
-
-## 当前状态
-
-**v0.1.3 提供 `GET /info`、`GET /search` 与 `GET /events`。** 对话、文件、审批等
-主链路仍然走 QwenPaw 核心 API，本插件只补三样核心没有的能力：
-
-- `/info`：让客户端检测「插件已安装、契约版本兼容」；
-- `/search`：会话历史全文检索（核心 API 没有按内容搜索的端点）；
-- `/events`：收件箱未读数与待审批条数的 `text/event-stream` 推送。
 
 ## 版本与能力
 
@@ -22,31 +13,31 @@ QwenPaw Node（Android 客户端）的配套插件，为客户端补上核心 AP
 | v0.1.0 | `GET /info` | `info` |
 | v0.1.1 | `GET /search` | `search` |
 | v0.1.2 | `GET /events` | `sse` |
-| v0.1.3 | 无新增端点；`/search` 的 `chat_id` 字段更正为 `session_id` | — |
+| v0.1.3 | 无新增端点；`/search` 的 `chat_id` 更正为 `session_id` | — |
 | v0.2.0（计划） | `/portability/*` | `portability` |
-| v0.3.0（计划） | 离线推送 channel | `push` |
-| v0.4.0（计划） | `WS /ssh`（二进制帧中继）、`GET /ssh/config`、`GET/PUT /ssh/settings`，控制台设置面板 `ui/index.js` | `ssh` |
+| v0.3.0（计划） | 离线推送 channel（无 HTTP 端点） | `push` |
+| v0.4.0（计划） | `WS /ssh`、`GET /ssh/config`、`GET/PUT /ssh/settings`，控制台设置面板 | `ssh` |
 
-**客户端只按 `capabilities` 里的名字开关功能，不比对版本号。** `plugin_version`
-只用于展示与排查。v0.1.3 的字段改名不改变 `capabilities`，但会改变 `/search`
-的响应形状，客户端需要同步更新，见下节。
+**客户端只按 `capabilities` 里的名字开关功能，不比对版本号**，`plugin_version`
+只用于展示与排查。字段改名不改变 `capabilities`，但会破坏旧客户端的解析，
+发版说明必须写明。
 
-## 安装
+## 快速开始
 
-安装包挂在 [Releases](https://github.com/csdeTR/QwenPaw-Node-Bridge/releases) 下，
-资产名固定为 `qwenpaw-node-bridge.zip`，因此链接有两种写法：
+在 QwenPaw Web 控制台的「插件」页填入下面的地址即可安装：
 
-- 最新版：`https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/latest/download/qwenpaw-node-bridge.zip`
-- 指定版本：`https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/download/v0.1.3/qwenpaw-node-bridge.zip`
+```
+https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/latest/download/qwenpaw-node-bridge.zip
+```
 
-在 QwenPaw 的 Web 控制台「插件」页填写上面的地址即可安装，也可以在命令行安装：
+也可以在命令行安装：
 
 ```bash
 ~/.qwenpaw/venv/bin/qwenpaw plugin install \
   https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/latest/download/qwenpaw-node-bridge.zip
 ```
 
-从源码打包时，在仓库根目录执行：
+从源码打包时，在仓库根目录执行（`plugin validate` 接受目录，不是 zip）：
 
 ```bash
 zip -r -X qwenpaw-node-bridge.zip plugin.json backend -x 'backend/__pycache__/*'
@@ -54,32 +45,23 @@ zip -r -X qwenpaw-node-bridge.zip plugin.json backend -x 'backend/__pycache__/*'
 ~/.qwenpaw/venv/bin/qwenpaw plugin install qwenpaw-node-bridge.zip
 ```
 
-`plugin validate` 接受的是目录，不是 zip；从源码校验时直接传仓库根目录。
-`__pycache__` 不进包，它是本地运行留下的字节码缓存。
-
-安装后重启 QwenPaw 服务端，再请求自述端点：
+安装后重启服务端，请求自述端点确认：
 
 ```bash
 curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 ```
-
-预期：
 
 ```json
 {"plugin_version":"0.1.3","protocol_version":1,
  "server_version":"2.2.2.post1","capabilities":["info","search","sse"]}
 ```
 
-未安装时该路径返回 404。返回 401 表示服务端开启了登录而请求没带 token，
-**不能**据此判断插件不存在。
+三点判据：未安装时该路径返回 404；返回 401 只说明服务端开了登录而请求没带 token，
+**不能**据此判断插件不存在；插件加载需要数秒，安装后立刻请求可能仍是 404，等十秒再试。
 
-插件加载需要数秒，安装后立刻请求可能仍返回 404，等十秒再试。
+## 端点契约
 
-## `/search` 的两个定位字段
-
-```
-GET /api/plugins/qwenpaw-node-bridge/search?q=<关键词>&limit=20&cursor=<偏移量>
-```
+### `/search` 的两个定位字段
 
 ```json
 {"items":[{"session_id":"mobile-70d0c538","msg_id":"0b1f485e…","role":"assistant",
@@ -89,125 +71,53 @@ GET /api/plugins/qwenpaw-node-bridge/search?q=<关键词>&limit=20&cursor=<偏�
 
 两条规则都由实测确定，与直觉相反：
 
-1. **`session_id` 是 `history.db` 的 `session_id` 列，不是 `/api/chats` 的对话 `id`。**
+1. **`session_id` 是 `history.db` 的列，不是 `/api/chats` 的对话 `id`。**
    两者在 `mobile-*` 形态下一一对应，但 Web 端的历史会话会出现一个 `session_id`
-   挂多个对话。直接拿它请求 `/api/chats/{id}` 会返回 404，客户端必须先用它到
-   对话列表换出对话 `id`。
-2. **`msg_id` 取 `dedup_key`（即消息对象的 `metadata.original_id`），不能用消息 `id`。**
+   挂多个对话。直接拿它请求 `/api/chats/{id}` 会 404，客户端要先去对话列表换出 `id`。
+2. **`msg_id` 取 `dedup_key`（即 `metadata.original_id`），不能用消息 `id`。**
    `GET /api/chats/{id}` 每次请求都会重新生成消息 `id`，只有 `original_id` 稳定。
 
-`q` 为空白返回 400；`limit` 默认 20、上限 100；`cursor` 是偏移量而不是记录 id。
-含中文的查询走 `LIKE` 并在插件侧截取片段，其余走 FTS5 的 `snippet()` 与 `bm25()`：
-`conversation_history_fts` 的 `tokenize='porter unicode61'` 不支持中文分词。
-检索范围限定 `kind in ('context_msg','model_turn')`，排除体积大且价值低的 `tool_result`。
+含中文的查询走 `LIKE` 并在插件侧截取片段，其余走 FTS5：`conversation_history_fts` 的
+`tokenize='porter unicode61'` 不支持中文分词。检索范围限定
+`kind in ('context_msg','model_turn')`，排除体积大且价值低的 `tool_result`。
+`q` 为空白返回 400；`limit` 默认 20、上限 100；`cursor` 是偏移量而非记录 id。
 
-## `/events` 的推送范围
+### `/events` 的推送范围
 
-```
-GET /api/plugins/qwenpaw-node-bridge/events
-Accept: text/event-stream
-```
+连接后先发 `ready`，随后各发一次 `inbox` 与 `approval` 的当前值，此后只在数值变化时推送；
+插件每 2.5 秒在连接内部轮询，客户端断开即退出生成器。
 
-```
-event: ready
-data: {"protocol_version":1}
-
-event: inbox
-data: {"unread_count":3}
-
-event: approval
-data: {"pending":1}
-```
-
-连接建立后先发 `ready`，随后各发一次 `inbox` 与 `approval` 的当前值，此后只在数值
-变化时推送。插件每 2.5 秒在连接内部轮询一次，客户端断开即退出生成器。
-
-**不包含定时任务。** `CronManager` 按 workspace 隔离，取摘要需要请求上下文里的智能体
-标识，而事件生成器里没有 `Request`。客户端的定时任务仍走轮询。
+**不包含定时任务。** `CronManager` 按 workspace 隔离，取摘要需要请求上下文里的智能体标识，
+而事件生成器里没有 `Request`，客户端的定时任务仍走轮询。
 
 ## v0.4.0 计划：SSH 通道与控制台设置
 
-给 QwenPaw Node 的终端页补第二个来源：客户端通过一条 WebSocket 中继，在插件上跑标准 SSH。
-服务端本地 PTY 只能连服务端自己，且渲染依赖客户端自己写的 VT 子集；
-SSH 拿到的是真正的 `xterm-256color` PTY，还能连服务端**可到达的其它主机**。
+给客户端的终端页补第二个来源：通过一条 WebSocket 中继跑标准 SSH。服务端本地 PTY 只能连
+服务端自己，且渲染依赖客户端自己写的 VT 子集；SSH 拿到真正的 `xterm-256color` PTY，
+还能连服务端**可到达的其它主机**。
 
-### 为什么是 WebSocket，不是裸 TCP
+用 WebSocket 而不是裸 TCP：实际部署通常只暴露 8088，反代不会转发第二个端口。
+宿主用 `app.include_router()` 挂载插件路由，FastAPI 会保留 `APIWebSocketRoute`，
+因此 `@router.websocket("/ssh")` 可用。
 
-裸 TCP 要在服务端另开一个端口，而实际部署通常只暴露 8088，反向代理不会转发第二个端口。
-WebSocket 走同一个 8088，`Upgrade` 之后就是全双工字节流，足够承载 SSH。
+三个端点：`WS /ssh`（二进制帧中继）、`GET /ssh/config`（脱敏配置，只回
+`key_configured`，私钥与口令永不回传）、`GET/PUT /ssh/settings`（控制台读写）。
+设置面板由插件自备 `ui/index.js`，经 `entry.frontend` 由 Console 动态 import。
 
-宿主挂载插件的路径是 `api.register_http_router(router, prefix=...)` →
-`plugins/registry.py` 的 `_mount_plugin_http_on_app` → `app.include_router(...)`。
-FastAPI 的 `include_router` 保留 `APIWebSocketRoute`，因此 `@router.websocket("/ssh")`
-会挂到 `/api/plugins/qwenpaw-node-bridge/ssh`。
+**四条安全约束**：WS 必须自己校验令牌（`AuthMiddleware` 是 `BaseHTTPMiddleware`，
+看不到 WebSocket）；默认只允许 `127.0.0.1:22`；主机密钥走 TOFU 不自动接受；
+私钥优先用服务端已有路径，粘贴方式落盘 `0600` 且不写日志。
 
-### 端点
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| WS | `/ssh` | 二进制帧中继到配置好的目标；连接时校验令牌 |
-| GET | `/ssh/config` | 脱敏后的连接信息，给客户端读 |
-| GET / PUT | `/ssh/settings` | 控制台读写完整设置（私钥只写不读） |
-
-`GET /ssh/config` 的响应：
-
-```json
-{"host": "127.0.0.1", "port": 22, "user": "csdetr",
- "auth": "key", "key_configured": true, "key_source": "file"}
-```
-
-私钥内容与口令**永不回传**，只回 `key_configured`。
-
-### 控制台设置面板
-
-`plugin.json` 增加 `entry.frontend: "ui/index.js"`，Console 通过
-`GET /api/frontend_plugin/{plugin_id}/files/ui/index.js` 动态 import 这个 ESM 模块，
-宿主提供 `window.QwenPaw.host.React` 与 `antd`。
-
-面板字段：
-
-| 项 | 类型 | 说明 |
-| --- | --- | --- |
-| 地址 | 文本 | 默认 `127.0.0.1` |
-| 端口 | 数字 | 默认 22 |
-| 用户名 | 文本 | 登录名 |
-| 认证方式 | 单选 | 密钥 / 密码 |
-| 私钥来源 | 单选 | 服务端已有路径（推荐）/ 粘贴私钥 |
-| 私钥 | 多行 | 仅「粘贴」方式出现，落盘 `0600` |
-| 口令 | 密码 | 只写不读 |
-
-**优先「服务端已有路径」**：私钥本来就在服务器上时，再复制一份进插件目录只是多一个泄漏点。
-粘贴方式用于没有现成密钥的场景，落盘必须 `0600`，且不写日志、不进备份。
-
-### 安全约束（不是建议）
-
-1. **WS 必须自己校验令牌。** `AuthMiddleware` 继承 `BaseHTTPMiddleware`
-   （`app/auth.py:724`），Starlette 这个基类只包裹 HTTP 作用域，**看不到 WebSocket**。
-   HTTP 那层的登录态对 WS 完全无效，漏校验就是一个匿名可达的 SSH 跳板。
-2. **默认只允许 `127.0.0.1:22`。** 改成其它主机等于把插件变成跳板，界面要明确提示；
-   并发连接数设上限。
-3. **主机密钥不得自动接受。** 首次连接走 TOFU，用户确认指纹后才记住。
-4. **私钥与口令只写不读**，端点不回传，日志不打印。
-
-### 客户端契约
-
-客户端在终端页给出二选一：服务端终端 / SSH 连接。**未装本插件或插件低于 v0.4.0 时，
-SSH 项置灰并给出安装地址**，不隐藏。选中 SSH 后先读 `GET /ssh/config`，
-`key_configured: false` 时引导用户去控制台补配置。
-
----
+完整契约见客户端仓库 `docs/protocol.md` 第 31.6 节。
 
 ## 三条加载器约束
 
 1. 后端入口必须导出名为 `plugin` 的对象，并实现 `register(api)`。
 2. `register_http_router` 的 `prefix` 不能是 `/`，也不能与其他插件重复。
-3. 只用核心没有的子路径。`/status` 与 `/files` 下的任意子路径已被核心
-   `plugins.py` 先注册，请求会被核心截走并返回 `Plugin '<id>' not found.`。
+3. 只用核心没有的子路径。`/status` 与 `/files` 下的任意子路径已被核心 `plugins.py`
+   先注册，请求会被核心截走并返回 `Plugin '<id>' not found.`。
 
 ## 协议版本
 
 `protocol_version` 不兼容时客户端按「未检测到」处理：更大的值说明契约已经变更，
-旧客户端不该继续使用本插件的端点。本文件新增端点时必须同步递增 `PROTOCOL_VERSION`。
-
-字段改名不同于新增端点（不改变 `PROTOCOL_VERSION`），但会破坏旧客户端的解析，
-发版说明必须写明。
+旧客户端不该继续使用本插件的端点。新增端点时必须同步递增 `PROTOCOL_VERSION`。
