@@ -23,22 +23,34 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sqlite3
+import time
 from pathlib import Path
+from urllib.parse import quote
+
+import httpx
+
+from qwenpaw.app.channels.base import BaseChannel, OnReplySent, ProcessHandler
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 import logging
 
 logger = logging.getLogger(__name__)
 
-#: 与客户端约定的契约版本。本文件新增端点时必须一起递增。
+#: 与客户端约定的契约版本。新增**能力**只追加 CAPABILITIES，不递增此值；
+#: 只有既有端点形状发生不兼容变化时才递增，否则旧客户端会直接判为未检测到。
 PROTOCOL_VERSION = 1
 
 #: 本插件声明的能力。客户端按名字开关功能，不看版本号。
-CAPABILITIES = ("info", "search", "sse")
+CAPABILITIES = ("info", "search", "sse", "portability", "push")
+
+#: 推送 channel 的唯一 key。不能与内置 channel 重名。
+PUSH_CHANNEL = "qwenpaw_node_push"
 
 #: 事件流的轮询间隔，与客户端原先 `push-messages` 的轮询周期一致。
 EVENT_POLL_SECONDS = 2.5
@@ -262,6 +274,345 @@ def _sse(event: str, data: dict) -> str:
     return "event: {}\ndata: {}\n\n".format(event, json.dumps(data, ensure_ascii=False))
 
 
+# ---------------------------------------------------------------- portability
+
+class _CreateImportJobRequest(BaseModel):
+    """用户在来源页勾选的应用。"""
+
+    sources: list[str] = Field(min_length=1, max_length=2)
+
+
+class _StartImportJobRequest(BaseModel):
+    """用户在清单页勾选的资产。"""
+
+    selections: dict
+    allow_plugin_execution: bool = False
+
+
+def _api_error(exc: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=409 if isinstance(exc, RuntimeError) else 400,
+        detail=str(exc),
+    )
+
+
+async def _portability_workspace(request: Request):
+    """解析当前请求对应的 agent。
+
+    插件路由不在 `/api/agents/{id}/...` 下，`request.state.agent_id` 取不到；
+    `get_agent_for_request` 会回落到 `X-Agent-Id` 头，客户端每个请求都带它。
+    """
+    from qwenpaw.app.agent_context import get_agent_for_request
+
+    return await get_agent_for_request(request)
+
+
+async def _require_qwenpaw_backend(workspace) -> None:
+    from qwenpaw.config.config import load_agent_config_async
+
+    if (await load_agent_config_async(workspace.agent_id)).backend != "qwenpaw":
+        raise RuntimeError(
+            "PawPort requires the destination Agent to use the qwenpaw backend",
+        )
+
+
+def _portability_router() -> APIRouter:
+    """portability 导入转发。
+
+    核心同名端点位于 `/api/agents/{id}/portability/imports/*`，由 `_local_only`
+    限制为回环地址；手机经局域网访问会得到 403。插件在服务端进程内运行，
+    直接调用任务管理器即可，不再复用核心 router —— 否则 `_local_only` 仍会拦截。
+
+    只暴露 sources / jobs 两类路径，不做任意路径转发。
+    """
+    router = APIRouter(prefix="/portability")
+
+    @router.get("/sources")
+    async def import_sources(request: Request):
+        from qwenpaw.portability.providers import (
+            provider_names,
+            resolve_source_location,
+        )
+
+        await _portability_workspace(request)
+        result = []
+        for source in provider_names():
+            location = resolve_source_location(source)
+            result.append(
+                {
+                    "source": source,
+                    "name": source.title(),
+                    "detected": bool(
+                        location.data_home_exists
+                        or location.user_data_home_exists
+                        or location.runtime_path
+                    ),
+                },
+            )
+        return result
+
+    @router.post("/jobs", status_code=202)
+    async def create_import_job(
+        body: _CreateImportJobRequest,
+        request: Request,
+    ):
+        from qwenpaw.app.routers.portability_imports import (
+            PORTABILITY_IMPORT_JOBS,
+        )
+
+        workspace = await _portability_workspace(request)
+        try:
+            await _require_qwenpaw_backend(workspace)
+            return await PORTABILITY_IMPORT_JOBS.create(workspace, body.sources)
+        except (ValueError, RuntimeError) as exc:
+            raise _api_error(exc) from exc
+
+    @router.get("/jobs/current")
+    async def current_import_job(request: Request):
+        from qwenpaw.app.routers.portability_imports import (
+            PORTABILITY_IMPORT_JOBS,
+        )
+
+        workspace = await _portability_workspace(request)
+        return await PORTABILITY_IMPORT_JOBS.current(workspace)
+
+    @router.get("/jobs/{job_id}")
+    async def get_import_job(job_id: str, request: Request):
+        from qwenpaw.app.routers.portability_imports import (
+            PORTABILITY_IMPORT_JOBS,
+        )
+
+        workspace = await _portability_workspace(request)
+        try:
+            return await PORTABILITY_IMPORT_JOBS.snapshot(workspace, job_id)
+        except (ValueError, RuntimeError) as exc:
+            raise _api_error(exc) from exc
+
+    @router.post("/jobs/{job_id}/start", status_code=202)
+    async def start_import_job(
+        job_id: str,
+        body: _StartImportJobRequest,
+        request: Request,
+    ):
+        from qwenpaw.app.routers.portability_imports import (
+            PORTABILITY_IMPORT_JOBS,
+        )
+        from qwenpaw.portability.models import ImportSelection
+
+        workspace = await _portability_workspace(request)
+        try:
+            await _require_qwenpaw_backend(workspace)
+            selections = {
+                key: ImportSelection.model_validate(value)
+                for key, value in body.selections.items()
+            }
+            if (
+                any(selection.plugins for selection in selections.values())
+                and not body.allow_plugin_execution
+            ):
+                raise ValueError(
+                    "confirm plugin code execution before importing",
+                )
+            return await PORTABILITY_IMPORT_JOBS.start(
+                workspace,
+                job_id,
+                selections,
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise _api_error(exc) from exc
+
+    @router.post("/jobs/{job_id}/retry", status_code=202)
+    async def retry_import_job(
+        job_id: str,
+        body: _StartImportJobRequest,
+        request: Request,
+    ):
+        from qwenpaw.app.routers.portability_imports import (
+            PORTABILITY_IMPORT_JOBS,
+        )
+        from qwenpaw.portability.models import ImportSelection
+
+        workspace = await _portability_workspace(request)
+        try:
+            await _require_qwenpaw_backend(workspace)
+            selections = {
+                key: ImportSelection.model_validate(value)
+                for key, value in body.selections.items()
+            }
+            if (
+                any(selection.plugins for selection in selections.values())
+                and not body.allow_plugin_execution
+            ):
+                raise ValueError(
+                    "confirm plugin code execution before importing",
+                )
+            return await PORTABILITY_IMPORT_JOBS.retry(
+                workspace,
+                job_id,
+                selections,
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise _api_error(exc) from exc
+
+    @router.post("/jobs/{job_id}/cancel")
+    async def cancel_import_job(job_id: str, request: Request):
+        from qwenpaw.app.routers.portability_imports import (
+            PORTABILITY_IMPORT_JOBS,
+        )
+
+        workspace = await _portability_workspace(request)
+        try:
+            return await PORTABILITY_IMPORT_JOBS.cancel(workspace, job_id)
+        except (ValueError, RuntimeError) as exc:
+            raise _api_error(exc) from exc
+
+    return router
+
+
+class NodeBridgePushChannel(BaseChannel):
+    """把收件箱与审批事件推送到 ntfy / Bark / Telegram。
+
+    这是本插件唯一能绕开「App 进程被杀就失联」的路径：事件源与 `/events`
+    相同，发送发生在服务端，不依赖手机常驻。
+    """
+
+    channel = PUSH_CHANNEL
+    # 不需要核心为它建消息队列：本 channel 只往外推，不接收用户消息。
+    uses_manager_queue = False
+
+    def __init__(
+        self,
+        process: ProcessHandler,
+        on_reply_sent: OnReplySent = None,
+        display_config=None,
+        no_text_debounce: bool = True,
+    ) -> None:
+        super().__init__(
+            process,
+            on_reply_sent,
+            display_config=display_config,
+            no_text_debounce=no_text_debounce,
+        )
+        self._config = None
+        self._task: asyncio.Task | None = None
+        self._last_push_at = 0.0
+
+    @classmethod
+    def from_config(
+        cls,
+        process: ProcessHandler,
+        config,
+        on_reply_sent: OnReplySent = None,
+        display_config=None,
+        no_text_debounce: bool = True,
+    ) -> "NodeBridgePushChannel":
+        instance = cls(
+            process,
+            on_reply_sent,
+            display_config=display_config,
+            no_text_debounce=no_text_debounce,
+        )
+        instance._config = config
+        return instance
+
+    def _get(self, name: str, default=""):
+        return getattr(self._config, name, default) if self._config is not None else default
+
+    @property
+    def _provider(self) -> str:
+        return str(self._get("provider", "ntfy") or "ntfy").strip().lower()
+
+    @property
+    def _target(self) -> str:
+        return str(self._get("target", "") or "").strip()
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        if not self._target:
+            logger.warning("推送 channel 未配置目标，跳过启动")
+            return
+        self._task = asyncio.create_task(self._poll_loop())
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+        logger.info("推送 channel 已停止")
+
+    async def send(self, to_handle: str, text: str, meta=None) -> None:
+        del to_handle, meta
+        await self._push("QwenPaw", text)
+
+    async def _poll_loop(self) -> None:
+        """连接内的轮询：只报「数值上升」，启动时先取一次基线。"""
+        last = await _snapshot()
+        interval = max(2.5, float(self._get("min_interval_seconds", 30) or 30))
+        while True:
+            await asyncio.sleep(5.0)
+            current = await _snapshot()
+            lines = []
+            if bool(self._get("notify_inbox", True)) and current["inbox"] > last["inbox"]:
+                lines.append(f"收件箱有 {current['inbox']} 条未读")
+            if bool(self._get("notify_approval", True)) and current["approval"] > last["approval"]:
+                lines.append(f"待审批 {current['approval']} 条")
+            if lines:
+                now = time.monotonic()
+                if now - self._last_push_at < interval:
+                    # 限流期间不推进基线：下一次 tick 仍会看到这次变化。
+                    continue
+                title = "QwenPaw 提醒"
+                text = "；".join(lines)
+                await self._push(title, text)
+                self._last_push_at = now
+            last = current
+
+    async def _push(self, title: str, text: str) -> None:
+        provider = self._provider
+        target = self._target
+        token = str(self._get("token", "") or "").strip()
+        server = str(self._get("server_url", "") or "").strip().rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                if provider == "ntfy":
+                    base = server or "https://ntfy.sh"
+                    headers = {}
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                    response = await client.post(
+                        f"{base}/{quote(target, safe='')}",
+                        content=f"{title}\n{text}".encode("utf-8"),
+                        headers=headers,
+                    )
+                    response.raise_for_status()
+                elif provider == "bark":
+                    base = server or "https://api.day.app"
+                    response = await client.post(
+                        f"{base}/push",
+                        json={"device_key": target, "title": title, "body": text},
+                    )
+                    response.raise_for_status()
+                elif provider == "telegram":
+                    if not token:
+                        logger.warning("Telegram 推送缺少 bot token，跳过")
+                        return
+                    response = await client.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": target, "text": f"{title}\n{text}"},
+                    )
+                    response.raise_for_status()
+                else:
+                    logger.warning("未知的推送服务 %s，跳过", provider)
+        except Exception as exc:  # pylint: disable=broad-except
+            # 不打印 URL 与 token：Telegram 的 URL 里带 token。
+            logger.warning("推送失败 provider=%s error=%s", provider, type(exc).__name__)
+
+
 class BridgePlugin:
     """插件主体。"""
 
@@ -370,7 +721,57 @@ class BridgePlugin:
                 },
             )
 
+        router.include_router(_portability_router())
         api.register_http_router(router, prefix=ROUTE_PREFIX)
+        api.register_channel(
+            channel_class=NodeBridgePushChannel,
+            label="QwenPaw Node 推送",
+            description="把收件箱与审批事件推送到 ntfy / Bark / Telegram",
+            config_fields=[
+                {
+                    "name": "provider",
+                    "label": "推送服务",
+                    "type": "select",
+                    "options": ["ntfy", "bark", "telegram"],
+                    "required": True,
+                    "default": "ntfy",
+                },
+                {
+                    "name": "target",
+                    "label": "目标（ntfy 主题 / Bark Key / Telegram chat id）",
+                    "type": "text",
+                    "required": True,
+                },
+                {
+                    "name": "token",
+                    "label": "令牌（ntfy 或 Telegram 需要时填写）",
+                    "type": "password",
+                },
+                {
+                    "name": "server_url",
+                    "label": "服务地址（自建服务时填写）",
+                    "type": "text",
+                },
+                {
+                    "name": "notify_inbox",
+                    "label": "推送收件箱未读",
+                    "type": "switch",
+                    "default": True,
+                },
+                {
+                    "name": "notify_approval",
+                    "label": "推送待审批",
+                    "type": "switch",
+                    "default": True,
+                },
+                {
+                    "name": "min_interval_seconds",
+                    "label": "最短推送间隔（秒）",
+                    "type": "number",
+                    "default": 30,
+                },
+            ],
+        )
         logger.info(
             "qwenpaw-node-bridge registered at %s (protocol=%s)",
             ROUTE_PREFIX,

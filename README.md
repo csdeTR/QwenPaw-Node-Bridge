@@ -12,11 +12,17 @@
 | v0.1.1 | `GET /search` | `search` |
 | v0.1.2 | `GET /events` | `sse` |
 | v0.1.3 | 无新增端点；`/search` 的 `chat_id` 更正为 `session_id` | — |
-| v0.2.0（计划） | `/portability/*` | `portability` |
-| v0.3.0（计划） | 离线推送 channel（无 HTTP 端点） | `push` |
+| v0.2.0 | portability 导入转发（随 v0.3.0 发出） | `/portability/*` | `portability` |
+| v0.3.0 | 离线推送 channel（无 HTTP 端点） | `push` |
 | v0.4.0（计划） | `WS /ssh`、`GET /ssh/config`、`GET/PUT /ssh/settings`，控制台设置面板 | `ssh` |
 
 **客户端只按 `capabilities` 里的名字开关功能，不比对版本号**，`plugin_version`只用于展示与排查。字段改名不改变 `capabilities`，但会破坏旧客户端的解析，发版说明必须写明。
+
+## v0.2.0 / v0.3.0：导入转发与离线推送
+
+`/portability/*` 转发核心的 `PortabilityImportJobManager`：`sources`、`jobs`、`jobs/current`、`jobs/{id}`、`start`、`retry`、`cancel`。核心同名端点被 `_local_only` 限制为回环地址，插件在服务端进程内直接调用任务管理器，因此手机经局域网可用。**只暴露导入，没有导出**；客户端导出走备份并清理临时备份条目。
+
+`qwenpaw_node_push` 是自定义 channel：轮询收件箱未读数与待审批数，数值上升时推到 ntfy / Bark / Telegram；启动取一次基线，不补推历史；`min_interval_seconds` 限流；令牌只写不读，日志不打印 URL 与 token。配置入口在 Web 控制台的 channel 设置里。
 
 ## 快速开始
 
@@ -48,8 +54,9 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 ```
 
 ```json
-{"plugin_version":"0.1.3","protocol_version":1,
- "server_version":"2.2.2.post1","capabilities":["info","search","sse"]}
+{"plugin_version":"0.3.0","protocol_version":1,
+ "server_version":"2.2.2.post1",
+ "capabilities":["info","search","sse","portability","push"]}
 ```
 
 三点判据：未安装时该路径返回 404；返回 401 只说明服务端开了登录而请求没带 token，**不能**据此判断插件不存在；插件加载需要数秒，安装后立刻请求可能仍是 404，等十秒再试。
@@ -97,7 +104,7 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 
 ## 协议版本
 
-`protocol_version` 不兼容时客户端按「未检测到」处理：更大的值说明契约已经变更，旧客户端不该继续使用本插件的端点。新增端点时必须同步递增 `PROTOCOL_VERSION`。字段改名不改变版本号，但会破坏旧客户端的解析，发版说明必须写明。
+`protocol_version` 不兼容时客户端按「未检测到」处理：更大的值说明契约已经变更，旧客户端不该继续使用本插件的端点。**新增能力只追加 `capabilities`，不递增 `PROTOCOL_VERSION`**；只有既有端点形状发生不兼容变化时才递增。字段改名不改变版本号，但会破坏旧客户端的解析，发版说明必须写明。
 
 ## 许可
 
