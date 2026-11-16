@@ -1,8 +1,8 @@
 # QwenPaw Node Bridge
 
-QwenPaw Node（Android 客户端）的配套插件，为客户端补上核心 API 没有提供的能力。
+[QwenPaw Node](https://github.com/csdeTR/QwenPaw-Node) 的配套插件，为客户端补上核心 API 没有提供的能力。
 
-插件与客户端是**两个独立仓库**，版本号各自编号：插件从 v0.1.0 起，与客户端版本
+插件与客户端是**两个独立仓库**，版本号各自编号，与客户端版本
 不一一对应。两端之间只有「端点路径 + 响应形状」这一层契约，记录在客户端仓库的
 `docs/protocol.md` 第 24 节。
 
