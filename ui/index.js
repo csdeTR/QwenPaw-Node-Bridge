@@ -11,6 +11,29 @@ const { Alert, Button, Card, Checkbox, Divider, Input, InputNumber, Radio, Space
 const Text = Typography.Text;
 const Paragraph = Typography.Paragraph;
 
+// 设置菜单图标。宿主对字符串图标只做 <span> 文本渲染，传 React 元素才会按图形画；
+// 画一个终端窗口加提示符，和「SSH 中继」这个功能对得上。
+function BridgeIcon() {
+  return h(
+    "svg",
+    {
+      width: 16,
+      height: 16,
+      viewBox: "0 0 24 24",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 1.8,
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      "aria-hidden": "true",
+      style: { display: "block" },
+    },
+    h("rect", { x: 3, y: 4, width: 18, height: 16, rx: 2.5 }),
+    h("path", { d: "M7 10l2.6 2.6L7 15.2" }),
+    h("path", { d: "M13 15.4h4" }),
+  );
+}
+
 // host.getApiUrl 会自行补上 /api 前缀，这里不能再带，否则请求会变成 /api/api/...
 const API_PATH = "/plugins/qwenpaw-node-bridge/ssh/settings";
 
@@ -52,7 +75,7 @@ function Field(props) {
   );
 }
 
-function SshSettings() {
+function SshSettingsPanel() {
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -148,12 +171,12 @@ function SshSettings() {
   }
 
   if (loading) {
-    return h(Card, { title: "QwenPaw Node Bridge" }, h(Text, null, "正在读取设置…"));
+    return h("div", null, h(Text, { type: "secondary" }, "正在读取设置…"));
   }
 
   return h(
-    Card,
-    { title: "QwenPaw Node Bridge" },
+    "div",
+    null,
     location.protocol === "http:"
       ? h(Alert, {
           type: "warning",
@@ -175,7 +198,7 @@ function SshSettings() {
     h(
       Paragraph,
       { type: "secondary" },
-      "SSH 设置：保存后手机端可经配套插件中继到该目标。未开启 Web 登录认证时，仅私有/回环地址或下方显式勾选「此地址仅我可访问」的地址可以读取凭据与保存设置；公网部署请开启登录认证与 HTTPS。该勾选只是用户确认，不是密码学保证。",
+      "保存后手机端可经配套插件中继到该目标。未开启 Web 登录认证时，仅私有/回环地址或下方显式勾选「此地址仅我可访问」的地址可以读取凭据与保存设置；公网部署请开启登录认证与 HTTPS。该勾选只是用户确认，不是密码学保证。",
     ),
     h(
       Space,
@@ -322,14 +345,71 @@ function SshSettings() {
   );
 }
 
+/**
+ * 插件设置页外壳。
+ *
+ * 菜单项只有一个（「QwenPaw Node Bridge」），页内按功能分块：目前只有 SSH 中继，
+ * 后续要加检索、推送等设置时，在 BLOCKS 里追加一项即可，不用再注册路由。
+ * `id` 用作锚点与折叠状态，改名会丢失用户已展开与否的偏好，因此保持稳定。
+ */
+const BLOCKS = [
+  {
+    id: "ssh",
+    title: "SSH 中继",
+    description: "配置手机端「Bridge 中继」使用的 SSH 目标。",
+    render: () => h(SshSettingsPanel),
+  },
+];
+
+function BridgeSettingsPage() {
+  const [openId, setOpenId] = React.useState(BLOCKS[0] ? BLOCKS[0].id : null);
+  return h(
+    "div",
+    null,
+    h(
+      Paragraph,
+      { type: "secondary", style: { marginBottom: 16 } },
+      "来自 QwenPaw Node Bridge 的设置。每块设置独立保存，改动不会影响其它块。",
+    ),
+    h(
+      Space,
+      { direction: "vertical", size: 16, style: { width: "100%" } },
+      ...BLOCKS.map((block) =>
+        h(
+          Card,
+          {
+            key: block.id,
+            title: block.title,
+            extra: h(
+              Button,
+              {
+                type: "link",
+                size: "small",
+                onClick: () => setOpenId((current) => (current === block.id ? null : block.id)),
+              },
+              openId === block.id ? "收起" : "展开",
+            ),
+          },
+          h(
+            Text,
+            { type: "secondary", style: { display: "block", marginBottom: openId === block.id ? 16 : 0 } },
+            block.description,
+          ),
+          openId === block.id ? block.render() : null,
+        ),
+      ),
+    ),
+  );
+}
+
 if (!window.__qwenpawNodeBridgeSshRoute) {
   window.__qwenpawNodeBridgeSshRoute = true;
   window.QwenPaw.registerRoutes("qwenpaw-node-bridge", [
     {
       path: "/plugin/qwenpaw-node-bridge/ssh",
       label: "QwenPaw Node Bridge",
-      icon: "SSH",
-      component: SshSettings,
+      icon: h(BridgeIcon),
+      component: BridgeSettingsPage,
       priority: 10,
     },
   ]);

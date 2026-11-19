@@ -15,6 +15,8 @@
 | v0.2.0 | portability 导入转发（随 v0.3.0 发出） | `/portability/*` | `portability` |
 | v0.3.0 | 离线推送 channel（无 HTTP 端点） | `push` |
 | v0.4.0 | `WS /ssh`、`GET /ssh/config`、`GET /ssh/credential`、`GET/PUT /ssh/settings`，控制台设置面板 | `ssh` |
+| v0.4.1 | 认证策略调整（未开 Web 认证时按私有/受信任来源放行）、Console 路由改名、修双 `/api` 前缀 404；无新端点 | 同上 |
+| v0.4.2 | 设置页分块与菜单图标；无新端点 | 同上 |
 
 **客户端只按 `capabilities` 里的名字开关功能，不比对版本号**，`plugin_version`只用于展示与排查。字段改名不改变 `capabilities`，但会破坏旧客户端的解析，发版说明必须写明。
 
@@ -55,7 +57,7 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 ```
 
 ```json
-{"plugin_version":"0.4.1","protocol_version":1,
+{"plugin_version":"0.4.2","protocol_version":1,
  "server_version":"2.2.2.post1",
  "capabilities":["info","search","sse","portability","push","ssh"]}
 ```
@@ -84,6 +86,12 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 连接后先发 `ready`，随后各发一次 `inbox` 与 `approval` 的当前值，此后只在数值变化时推送；插件每 2.5 秒在连接内部轮询，客户端断开即退出生成器。
 
 **不包含定时任务。** `CronManager` 按 workspace 隔离，取摘要需要请求上下文里的智能体标识，而事件生成器里没有 `Request`，客户端的定时任务仍走轮询。
+
+## v0.4.2：设置页分块与菜单图标
+
+- 设置页改为「页面 + 可分块」结构：菜单项仍只有一个「QwenPaw Node Bridge」，页内按功能分成可折叠的卡片，目前只有「SSH 中继」一块。后续加设置只需在 `ui/index.js` 的 `BLOCKS` 里追加一项，不用再注册路由。
+- 菜单图标由文字「SSH」换成终端图形。宿主的菜单渲染对 `icon` 做 `isValidElement` 判断：传 React 元素按图形画，传字符串只会渲染成一段文字，所以这里传的是 SVG 元素。
+- 端点、字段与保存逻辑均未变。
 
 ## v0.4.1：SSH 访问策略与 Console 命名
 
