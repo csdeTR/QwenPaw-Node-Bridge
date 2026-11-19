@@ -22,8 +22,10 @@ v0.1.3 提供 `GET /info`、`GET /search` 与 `GET /events`。后续能力（`po
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -34,8 +36,16 @@ import httpx
 
 from qwenpaw.app.channels.base import BaseChannel, OnReplySent, ProcessHandler
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi import (
+    APIRouter,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import logging
@@ -47,7 +57,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 1
 
 #: 本插件声明的能力。客户端按名字开关功能，不看版本号。
-CAPABILITIES = ("info", "search", "sse", "portability", "push")
+CAPABILITIES = ("info", "search", "sse", "portability", "push", "ssh")
 
 #: 推送 channel 的唯一 key。不能与内置 channel 重名。
 PUSH_CHANNEL = "qwenpaw_node_push"
@@ -613,6 +623,322 @@ class NodeBridgePushChannel(BaseChannel):
             logger.warning("推送失败 provider=%s error=%s", provider, type(exc).__name__)
 
 
+# ------------------------------------------------------------------- ssh
+
+#: 同时允许的 SSH 中继连接数。SSH 只服务一个用户，4 条足够覆盖多窗口。
+SSH_MAX_CONNECTIONS = 4
+
+#: 私钥文件上限。正常的 OpenSSH 私钥只有几 KB，超过这个值说明配错了路径。
+SSH_KEY_MAX_BYTES = 256 * 1024
+
+#: 当前活动的 SSH 中继数。只在事件循环内增减，不需要额外加锁。
+_ssh_active_connections = 0
+
+
+def _ssh_data_dir() -> Path:
+    """插件自己的数据目录。
+
+    不放在插件源码目录：重装或升级插件时会整目录替换。``QWENPAW_NODE_BRIDGE_DATA_DIR``
+    只给测试用，生产环境固定在 ``~/.qwenpaw/plugin_data/qwenpaw-node-bridge``。
+    """
+    override = os.environ.get("QWENPAW_NODE_BRIDGE_DATA_DIR")
+    if override:
+        root = Path(override).expanduser()
+    else:
+        from qwenpaw.constant import WORKING_DIR
+
+        root = Path(WORKING_DIR) / "plugin_data" / "qwenpaw-node-bridge"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    return root
+
+
+def _ssh_settings_path() -> Path:
+    return _ssh_data_dir() / "ssh_settings.json"
+
+
+def _ssh_key_path() -> Path:
+    return _ssh_data_dir() / "ssh_key"
+
+
+def _load_ssh_settings() -> dict:
+    try:
+        data = json.loads(_ssh_settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_ssh_settings(data: dict) -> None:
+    path = _ssh_settings_path()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _write_inline_key(key: str) -> None:
+    path = _ssh_key_path()
+    path.write_text(key, encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def _read_inline_key() -> str | None:
+    try:
+        return _ssh_key_path().read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _delete_inline_key() -> None:
+    try:
+        _ssh_key_path().unlink()
+    except OSError:
+        pass
+
+
+def _masked_ssh_settings() -> dict:
+    """给界面看的设置。私钥内容、口令与登录密码永不回传。"""
+    data = _load_ssh_settings()
+    auth = str(data.get("auth", "key")).lower()
+    key_source = str(data.get("key_source", "file")).lower()
+    key_path = str(data.get("key_path", ""))
+    if auth == "key":
+        if key_source == "inline":
+            key_configured = _read_inline_key() is not None
+        else:
+            key_configured = bool(key_path) and Path(key_path).expanduser().is_file()
+    else:
+        key_configured = False
+    return {
+        "host": str(data.get("host", "127.0.0.1")),
+        "port": int(data.get("port", 22) or 22),
+        "user": str(data.get("user", "")),
+        "auth": auth,
+        "key_source": key_source,
+        "key_path": key_path,
+        "key_configured": key_configured,
+        "password_configured": bool(str(data.get("password", ""))),
+        "passphrase_configured": bool(str(data.get("passphrase", ""))),
+        "configured": bool(str(data.get("user", "")).strip()),
+    }
+
+
+def _validate_ssh_settings(body: dict, current: dict) -> dict:
+    """校验并合并设置；空白密钥字段表示保留原值。"""
+    host = str(body.get("host", current.get("host", "127.0.0.1"))).strip()
+    if not host:
+        raise ValueError("主机地址不能为空")
+    try:
+        port = int(body.get("port", current.get("port", 22)))
+    except (TypeError, ValueError):
+        raise ValueError("端口必须是整数") from None
+    if not 1 <= port <= 65535:
+        raise ValueError("端口必须在 1–65535 之间")
+    user = str(body.get("user", current.get("user", ""))).strip()
+    if not user:
+        raise ValueError("用户名不能为空")
+    auth = str(body.get("auth", current.get("auth", "key"))).strip().lower()
+    if auth not in ("key", "password"):
+        raise ValueError("认证方式只能是密钥或密码")
+    key_source = str(
+        body.get("key_source", current.get("key_source", "file")),
+    ).strip().lower()
+    if key_source not in ("file", "inline"):
+        raise ValueError("私钥来源只能是服务端路径或粘贴私钥")
+    key_path = str(body.get("key_path", current.get("key_path", ""))).strip()
+    if auth == "key" and key_source == "file":
+        if not key_path:
+            raise ValueError("密钥认证需要填写服务端私钥路径")
+        if not Path(key_path).expanduser().is_file():
+            raise ValueError("私钥路径不存在或不是文件")
+
+    next_data = dict(current)
+    next_data.update(
+        {
+            "host": host,
+            "port": port,
+            "user": user,
+            "auth": auth,
+            "key_source": key_source,
+            "key_path": key_path,
+        },
+    )
+
+    private_key = body.get("private_key")
+    if isinstance(private_key, str) and private_key.strip():
+        if auth != "key" or key_source != "inline":
+            raise ValueError("只有「密钥 + 粘贴私钥」方式才需要私钥内容")
+        next_data["_new_inline_key"] = private_key.strip() + "\n"
+    password = body.get("password")
+    if isinstance(password, str) and password:
+        next_data["password"] = password
+    passphrase = body.get("passphrase")
+    if isinstance(passphrase, str) and passphrase:
+        next_data["passphrase"] = passphrase
+
+    if auth == "password" and not str(next_data.get("password", "")):
+        raise ValueError("密码认证需要填写登录密码")
+    if (
+        auth == "key"
+        and key_source == "inline"
+        and "_new_inline_key" not in next_data
+        and _read_inline_key() is None
+    ):
+        raise ValueError("粘贴私钥方式需要填写私钥内容")
+    return next_data
+
+
+def _apply_ssh_settings(body: dict) -> dict:
+    current = _load_ssh_settings()
+    data = _validate_ssh_settings(body, current)
+    new_key = data.pop("_new_inline_key", None)
+    if new_key is not None:
+        _write_inline_key(new_key)
+    if data.get("auth") != "key" or data.get("key_source") != "inline":
+        # 不再使用粘贴的私钥时删除它，避免多留一份明文。
+        _delete_inline_key()
+    _save_ssh_settings(data)
+    return _masked_ssh_settings()
+
+
+def _ssh_auth_enabled() -> bool:
+    try:
+        from qwenpaw.app.auth import is_auth_enabled
+
+        return bool(is_auth_enabled())
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
+def _ssh_token_user(token: str | None) -> str | None:
+    if not token:
+        return None
+    try:
+        from qwenpaw.app.auth import (
+            has_registered_users,
+            is_auth_enabled,
+            verify_token,
+        )
+
+        if not is_auth_enabled() or not has_registered_users():
+            return None
+        return verify_token(token)
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _ws_token(websocket: WebSocket) -> str | None:
+    authorization = websocket.headers.get("authorization", "")
+    if authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+        if token:
+            return token
+    token = websocket.query_params.get("token")
+    return token.strip() if token else None
+
+
+def _http_token(request: Request) -> str | None:
+    authorization = request.headers.get("authorization", "")
+    if authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+        if token:
+            return token
+    token = request.query_params.get("token")
+    return token.strip() if token else None
+
+
+TRUSTED_HOST_HEADER = "x-qwenpaw-trusted-host"
+
+
+def _is_private_client(host: str | None) -> bool:
+    """回环与私有地址；EasyTier/VPN 的 10.x 地址也属于这一类。"""
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback
+
+
+def _trusted_header(headers) -> bool:
+    return str(headers.get(TRUSTED_HOST_HEADER, "")).strip() == "1"
+
+
+def _ssh_access_allowed(
+    *,
+    token: str | None,
+    client_host: str | None,
+    headers,
+) -> bool:
+    """SSH 敏感端点的统一访问策略。
+
+    开了 Web 登录认证时只认有效 token；没开时只放行私有/回环地址，或 App/
+    Console 在用户显式确认后发来的受信任标记。标记不是密码学证明，公网部署
+    仍应开启认证与 HTTPS。
+    """
+    if _ssh_auth_enabled():
+        return bool(_ssh_token_user(token))
+    return _is_private_client(client_host) or _trusted_header(headers)
+
+
+def _require_ssh_access(request: Request) -> None:
+    """插件的 HTTP 敏感端点自己做一次访问校验。
+
+    不能只依赖核心的 ``AuthMiddleware``：实测在服务端热切换鉴权开关后，带空
+    ``Authorization: Bearer`` 的请求仍能到达插件路由。因此这里同时检查鉴权开关、
+    用户集合与客户端来源。
+    """
+    client_host = request.client.host if request.client else None
+    if not _ssh_access_allowed(
+        token=_http_token(request),
+        client_host=client_host,
+        headers=request.headers,
+    ):
+        raise HTTPException(401, "SSH requires authentication")
+
+
+def _ssh_credential() -> dict:
+    """按需组装凭据。调用方必须先确认访问策略已放行。
+
+    这个返回值含私钥或登录密码，**不能写进任何日志**，也不能放进错误 detail。
+    """
+    data = _load_ssh_settings()
+    if not str(data.get("user", "")).strip():
+        raise HTTPException(404, "SSH 目标尚未配置")
+    auth = str(data.get("auth", "key")).lower()
+    if auth == "password":
+        password = str(data.get("password", ""))
+        if not password:
+            raise HTTPException(409, "SSH 登录密码尚未配置")
+        return {"auth": "password", "password": password}
+
+    key_source = str(data.get("key_source", "file")).lower()
+    if key_source == "inline":
+        private_key = _read_inline_key()
+    else:
+        key_path = Path(str(data.get("key_path", ""))).expanduser()
+        if not key_path.is_file():
+            raise HTTPException(409, "SSH 私钥文件不可用")
+        if key_path.stat().st_size > SSH_KEY_MAX_BYTES:
+            raise HTTPException(413, "SSH 私钥文件过大")
+        try:
+            private_key = key_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(409, "SSH 私钥文件不可读") from exc
+    if not private_key:
+        raise HTTPException(409, "SSH 私钥尚未配置")
+    return {
+        "auth": "key",
+        "private_key": private_key,
+        "passphrase": str(data.get("passphrase", "")),
+    }
+
+
 class BridgePlugin:
     """插件主体。"""
 
@@ -720,6 +1046,161 @@ class BridgePlugin:
                     "X-Accel-Buffering": "no",
                 },
             )
+
+        @router.get("/ssh/settings")
+        async def ssh_settings():
+            """脱敏设置。私钥、口令与登录密码不回传。"""
+            return _masked_ssh_settings()
+
+        @router.put("/ssh/settings")
+        async def update_ssh_settings(request: Request, body: dict):
+            """写设置；空白密钥字段表示保留原值。
+
+            自己校验访问策略：核心中间件在鉴权开关热切换的边界上不可靠（实测空 Bearer
+            仍能到达插件），这条写路径又直接落盘私钥/口令，不能只靠外层。
+            """
+            _require_ssh_access(request)
+            try:
+                return _apply_ssh_settings(body)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
+        @router.get("/ssh/config")
+        async def ssh_config():
+            """给手机端的脱敏目标信息；私钥与口令永不在这里出现。"""
+            data = _masked_ssh_settings()
+            if not data["configured"]:
+                raise HTTPException(404, "SSH 目标尚未配置")
+            return {
+                "host": data["host"],
+                "port": data["port"],
+                "user": data["user"],
+                "auth": data["auth"],
+                "key_configured": data["key_configured"],
+                "key_source": data["key_source"],
+            }
+
+        @router.get("/ssh/credential")
+        async def ssh_credential(request: Request):
+            """按需下发凭据。
+
+            不依赖核心中间件的鉴权：这里返回私钥或登录密码，必须自己校验访问策略。
+            """
+            _require_ssh_access(request)
+            return JSONResponse(
+                _ssh_credential(),
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @router.websocket("/ssh")
+        async def ssh_relay(websocket: WebSocket):
+            """二进制帧中继到设置里的 host:port。
+
+            **AuthMiddleware 看不到 WebSocket 连接**，因此 token 必须在这里校验。
+            只连设置里的目标，不接受客户端指定主机；并发数受限。
+            """
+            global _ssh_active_connections  # pylint: disable=global-statement
+            token = _ws_token(websocket)
+
+            async def reject(code: int, reason: str) -> None:
+                """先完成握手再关闭。
+
+                Starlette 在 ``accept()`` 之前 `close()` 会变成 HTTP 403，客户端分不清
+                「没登录」「没配置」与「连不上」。先 accept 再发关闭帧，才能把原因带给客户端。
+                """
+                await websocket.accept()
+                await websocket.close(code=code, reason=reason)
+
+            client_host = websocket.client.host if websocket.client else None
+            if not _ssh_access_allowed(
+                token=token,
+                client_host=client_host,
+                headers=websocket.headers,
+            ):
+                await reject(1008, "unauthorized")
+                return
+            data = _load_ssh_settings()
+            host = str(data.get("host", "")).strip()
+            try:
+                port = int(data.get("port", 22) or 22)
+            except (TypeError, ValueError):
+                port = 22
+            if not host or not str(data.get("user", "")).strip():
+                await reject(1008, "not configured")
+                return
+            if _ssh_active_connections >= SSH_MAX_CONNECTIONS:
+                await reject(1013, "busy")
+                return
+
+            await websocket.accept()
+            _ssh_active_connections += 1
+            writer = None
+            logger.info("SSH relay connected target=%s:%s", host, port)
+            try:
+                try:
+                    reader, writer = await asyncio.open_connection(host, port)
+                except OSError:
+                    logger.warning("SSH relay target unreachable target=%s:%s", host, port)
+                    await websocket.close(code=1011, reason="target unreachable")
+                    return
+
+                async def socket_to_ws():
+                    try:
+                        while True:
+                            chunk = await reader.read(16384)
+                            if not chunk:
+                                break
+                            await websocket.send_bytes(chunk)
+                    except (
+                        WebSocketDisconnect,
+                        RuntimeError,
+                        ConnectionError,
+                    ):
+                        pass
+
+                async def ws_to_socket():
+                    try:
+                        while True:
+                            message = await websocket.receive()
+                            if message.get("type") == "websocket.disconnect":
+                                break
+                            chunk = message.get("bytes")
+                            if not chunk:
+                                # 只接受二进制帧；文本帧丢弃。
+                                continue
+                            writer.write(chunk)
+                            await writer.drain()
+                    except (
+                        WebSocketDisconnect,
+                        RuntimeError,
+                        ConnectionError,
+                    ):
+                        pass
+
+                tasks = {
+                    asyncio.create_task(socket_to_ws()),
+                    asyncio.create_task(ws_to_socket()),
+                }
+                _, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            finally:
+                if writer is not None:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+                _ssh_active_connections -= 1
+                try:
+                    await websocket.close()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                logger.info("SSH relay disconnected target=%s:%s", host, port)
 
         router.include_router(_portability_router())
         api.register_http_router(router, prefix=ROUTE_PREFIX)

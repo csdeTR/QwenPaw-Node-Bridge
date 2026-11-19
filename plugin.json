@@ -1,12 +1,13 @@
 {
   "id": "qwenpaw-node-bridge",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "name": "QwenPaw Node Bridge",
   "description": "为 QwenPaw Node Android 客户端提供桥接端点",
   "author": "QwenPaw Node",
   "type": "general",
   "entry": {
-    "backend": "backend/main.py"
+    "backend": "backend/main.py",
+    "frontend": "ui/index.js"
   },
   "min_version": "2.2.2",
   "meta": {
@@ -15,7 +16,8 @@
       "search",
       "sse",
       "portability",
-      "push"
+      "push",
+      "ssh"
     ]
   }
 }

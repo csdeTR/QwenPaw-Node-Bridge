@@ -14,7 +14,7 @@
 | v0.1.3 | 无新增端点；`/search` 的 `chat_id` 更正为 `session_id` | — |
 | v0.2.0 | portability 导入转发（随 v0.3.0 发出） | `/portability/*` | `portability` |
 | v0.3.0 | 离线推送 channel（无 HTTP 端点） | `push` |
-| v0.4.0（计划） | `WS /ssh`、`GET /ssh/config`、`GET/PUT /ssh/settings`，控制台设置面板 | `ssh` |
+| v0.4.0 | `WS /ssh`、`GET /ssh/config`、`GET /ssh/credential`、`GET/PUT /ssh/settings`，控制台设置面板 | `ssh` |
 
 **客户端只按 `capabilities` 里的名字开关功能，不比对版本号**，`plugin_version`只用于展示与排查。字段改名不改变 `capabilities`，但会破坏旧客户端的解析，发版说明必须写明。
 
@@ -42,7 +42,8 @@ https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/latest/download/qwenpaw-n
 从源码打包时，在仓库根目录执行（`plugin validate` 接受目录，不是 zip）：
 
 ```bash
-zip -r -X qwenpaw-node-bridge.zip plugin.json backend -x 'backend/__pycache__/*'
+zip -r -X qwenpaw-node-bridge.zip plugin.json backend ui \
+  -x 'backend/__pycache__/*' 'backend/tests/*'
 ~/.qwenpaw/venv/bin/qwenpaw plugin validate .
 ~/.qwenpaw/venv/bin/qwenpaw plugin install qwenpaw-node-bridge.zip
 ```
@@ -54,9 +55,9 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 ```
 
 ```json
-{"plugin_version":"0.3.0","protocol_version":1,
+{"plugin_version":"0.4.1","protocol_version":1,
  "server_version":"2.2.2.post1",
- "capabilities":["info","search","sse","portability","push"]}
+ "capabilities":["info","search","sse","portability","push","ssh"]}
 ```
 
 三点判据：未安装时该路径返回 404；返回 401 只说明服务端开了登录而请求没带 token，**不能**据此判断插件不存在；插件加载需要数秒，安装后立刻请求可能仍是 404，等十秒再试。
@@ -84,15 +85,47 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 
 **不包含定时任务。** `CronManager` 按 workspace 隔离，取摘要需要请求上下文里的智能体标识，而事件生成器里没有 `Request`，客户端的定时任务仍走轮询。
 
-## v0.4.0 计划：SSH 通道与控制台设置
+## v0.4.1：SSH 访问策略与 Console 命名
 
-给客户端的终端页补第二个来源：通过一条 WebSocket 中继跑标准 SSH。服务端本地 PTY 只能连服务端自己，且渲染依赖客户端自己写的 VT 子集；SSH 拿到真正的 `xterm-256color` PTY，还能连服务端**可到达的其它主机**。
+- **Bridge 中继不再要求服务端 Web 登录认证。** 本地 PTY 仍然要求；中继只要求 Console 里配置了 SSH 目标与凭据。
+- 未开 Web 认证时，`PUT /ssh/settings`、`GET /ssh/credential` 与 `WS /ssh` 只放行**私有/回环客户端**，或带 `X-QwenPaw-Trusted-Host: 1` 的请求。该标记由 App 在「受信任的连接」确认地址后、或 Console 页面勾选「此地址仅我可访问」后发送；它只是用户确认，不是密码学证明。公网部署仍应开启登录认证与 HTTPS。
+- 开了 Web 认证时行为不变：敏感端点要求有效 token。
+- Console 的宿主分组「扩展设置」不变；插件路由 label 由「SSH 设置」改为 **QwenPaw Node Bridge**，页面内仍只放 SSH 设置。
+- 修复 Console 页面请求路径重复 `/api` 前缀导致的 404：`host.getApiUrl` 会自动补 `/api`，前端只传 `/plugins/qwenpaw-node-bridge/ssh/settings`。
 
-用 WebSocket 而不是裸 TCP：实际部署通常只暴露 8088，反代不会转发第二个端口。宿主用 `app.include_router()` 挂载插件路由，FastAPI 会保留 `APIWebSocketRoute`，因此 `@router.websocket("/ssh")` 可用。
+## v0.4.0：SSH 通道与控制台设置
 
-三个端点：`WS /ssh`（二进制帧中继）、`GET /ssh/config`（脱敏配置，只回`key_configured`，私钥与口令永不回传）、`GET/PUT /ssh/settings`（控制台读写）。设置面板由插件自备 `ui/index.js`，经 `entry.frontend` 由 Console 动态 import。
+> v0.4.1 起 SSH 端点的认证策略有调整，见上一节；端点路径与设置字段不变。
 
-**四条安全约束**：WS 必须自己校验令牌（`AuthMiddleware` 是 `BaseHTTPMiddleware`，看不到 WebSocket）；默认只允许 `127.0.0.1:22`；主机密钥走 TOFU 不自动接受；私钥优先用服务端已有路径，粘贴方式落盘 `0600` 且不写日志。
+给客户端的终端页补第二个来源：通过一条 WebSocket 中继跑标准 SSH。服务端本地 PTY 只能连服务端自己；SSH 还能连服务端**可到达的其它主机**。
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| WS | `/ssh` | 二进制帧中继到设置里的 host:port |
+| GET | `/ssh/config` | 脱敏目标信息；私钥与口令永不回传 |
+| GET | `/ssh/credential` | 按需下发私钥或登录密码；访问策略见 v0.4.1，`Cache-Control: no-store`，不写日志 |
+| GET / PUT | `/ssh/settings` | 控制台读写完整设置；空白密钥字段保留原值；访问策略见 v0.4.1 |
+
+### 安全约束
+
+1. **WS 自己校验令牌。** `AuthMiddleware` 继承 `BaseHTTPMiddleware`，看不到 WebSocket 连接；插件在 `accept()` 前用 `qwenpaw.app.auth.verify_token` 校验 `Authorization: Bearer` 或 `?token=`。未开鉴权、token 无效、目标未配置一律 `1008` 关闭。
+2. **只连设置里的目标。** 客户端不能指定主机；默认 `127.0.0.1:22`。并发上限 4。
+3. **凭据按需下发。** `/ssh/credential` 只在服务端已开启登录鉴权时可调用；私钥或密码只放在手机端内存里。手机端还会先过地址安全校验：公网明文地址未确认自有时不请求凭据。
+4. **HTTP 敏感端点自己也校验令牌。** `PUT /ssh/settings` 与 `GET /ssh/credential` 不依赖核心中间件：实测鉴权开关热切换后，带空 `Authorization: Bearer` 的请求仍能到达插件路由。插件在 handler 里再调一次 `verify_token`，失败回 401；WS 更是必须在 `accept()` 前后自行校验。
+5. **主机密钥 TOFU 在客户端做。** 插件只中继字节；首次指纹确认、指纹变化告警由客户端负责。
+6. **设置落盘在 `~/.qwenpaw/plugin_data/qwenpaw-node-bridge/`**，目录 `0700`、文件 `0600`；不放在插件源码目录，避免升级覆盖。私钥优先用服务端已有路径，粘贴方式才写 `ssh_key`。
+
+### 控制台设置面板
+
+`ui/index.js` 通过 `window.QwenPaw.registerRoutes("qwenpaw-node-bridge", …)` 挂到 Settings →「扩展设置」→「QwenPaw Node Bridge」，使用宿主注入的 `React` / `antd` / `getApiUrl` / `getApiToken`。字段为地址、端口、用户名、认证方式、私钥来源、私钥路径或内容、口令、登录密码；保存后只显示「已配置 / 未配置」。未开 Web 认证时可用「此地址仅我可访问」勾选放行公网受信任地址；页面使用 HTTP 时显示明文传输警告。
+
+### 测试
+
+```bash
+~/.qwenpaw/venv/bin/python -m unittest discover -s backend/tests -v
+```
 
 完整契约见客户端仓库 `docs/protocol.md` 第 31.6 节。
 
