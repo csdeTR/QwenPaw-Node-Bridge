@@ -35,15 +35,16 @@ function BridgeIcon() {
 }
 
 // host.getApiUrl 会自行补上 /api 前缀，这里不能再带，否则请求会变成 /api/api/...
-const API_PATH = "/plugins/qwenpaw-node-bridge/ssh/settings";
+const SSH_API_PATH = "/plugins/qwenpaw-node-bridge/ssh/settings";
+const PAIRING_API_PATH = "/plugins/qwenpaw-node-bridge/pairing/tokens";
 
-async function request(method, body, options) {
+async function request(path, method, body, options) {
   const headers = {};
   const token = host.getApiToken ? host.getApiToken() : "";
   if (token) headers.Authorization = "Bearer " + token;
   if (options && options.trusted) headers["X-QwenPaw-Trusted-Host"] = "1";
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  const response = await fetch(host.getApiUrl(API_PATH), {
+  const response = await fetch(host.getApiUrl(path), {
     method,
     headers,
     credentials: "same-origin",
@@ -103,7 +104,7 @@ function SshSettingsPanel() {
     setLoading(true);
     setError("");
     try {
-      const data = await request("GET");
+      const data = await request(SSH_API_PATH, "GET");
       setForm({
         host: data.host || "127.0.0.1",
         port: data.port || 22,
@@ -154,7 +155,7 @@ function SshSettingsPanel() {
     if (passphrase) body.passphrase = passphrase;
     setSaving(true);
     try {
-      const data = await request("PUT", body, { trusted });
+      const data = await request(SSH_API_PATH, "PUT", body, { trusted });
       setKeyConfigured(Boolean(data.key_configured));
       setPasswordConfigured(Boolean(data.password_configured));
       setPassphraseConfigured(Boolean(data.passphrase_configured));
@@ -346,6 +347,316 @@ function SshSettingsPanel() {
 }
 
 /**
+ * 设备配对面板。
+ *
+ * 签发一枚移动端访问令牌并画成二维码。二维码里同时带服务器地址与令牌，
+ * 手机扫码即可建立实例。令牌只显示一次，登记表里只有元数据。
+ */
+function PairingPanel() {
+  const [error, setError] = React.useState("");
+  const [issuing, setIssuing] = React.useState(false);
+  const [days, setDays] = React.useState(30);
+  const [label, setLabel] = React.useState("");
+  const [addressText, setAddressText] = React.useState(
+    typeof window !== "undefined" && window.location ? window.location.origin : "",
+  );
+  const [issued, setIssued] = React.useState(null);
+  const [items, setItems] = React.useState([]);
+  const [editing, setEditing] = React.useState(null);
+  const [listed, setListed] = React.useState(false);
+
+  function parseAddresses() {
+    return addressText
+      .split(/\s+/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  }
+
+  async function loadList() {
+    try {
+      const data = await request(PAIRING_API_PATH, "GET");
+      setItems(Array.isArray(data.items) ? data.items : []);
+      setListed(true);
+    } catch (err) {
+      setError(String(err.message || err));
+    }
+  }
+
+  React.useEffect(() => {
+    loadList();
+  }, []);
+
+  async function issue() {
+    setError("");
+    const addresses = parseAddresses();
+    if (!addresses.length) {
+      setError("至少填写一个服务器地址");
+      return;
+    }
+    setIssuing(true);
+    try {
+      const data = await request(PAIRING_API_PATH, "POST", {
+        expires_in_days: days,
+        label: label.trim(),
+        addresses,
+      });
+      setIssued(data);
+      await loadList();
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setIssuing(false);
+    }
+  }
+
+  async function revoke(jti) {
+    setError("");
+    try {
+      await request(PAIRING_API_PATH + "/" + encodeURIComponent(jti) + "/revoke", "POST");
+      message.success("已吊销该令牌");
+      await loadList();
+    } catch (err) {
+      setError(String(err.message || err));
+    }
+  }
+
+  async function rename(jti, label) {
+    setError("");
+    try {
+      await request(PAIRING_API_PATH + "/" + encodeURIComponent(jti), "PATCH", { label });
+      message.success("名称已更新");
+      setEditing(null);
+      await loadList();
+    } catch (err) {
+      setError(String(err.message || err));
+    }
+  }
+
+  async function remove(jti) {
+    setError("");
+    try {
+      await request(PAIRING_API_PATH + "/" + encodeURIComponent(jti), "DELETE");
+      message.success("已删除该条目");
+      await loadList();
+    } catch (err) {
+      setError(String(err.message || err));
+    }
+  }
+
+  function copyToken() {
+    if (!issued || !issued.token) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(issued.token).then(
+        () => message.success("令牌已复制"),
+        () => setError("复制失败，请手动选择文本"),
+      );
+    } else {
+      setError("当前浏览器不支持自动复制，请手动选择文本");
+    }
+  }
+
+  function expiryText(epochSeconds) {
+    if (!epochSeconds) return "未知";
+    const date = new Date(epochSeconds * 1000);
+    if (Number.isNaN(date.getTime())) return "未知";
+    const pad = (n) => String(n).padStart(2, "0");
+    return (
+      date.getFullYear() +
+      "-" +
+      pad(date.getMonth() + 1) +
+      "-" +
+      pad(date.getDate()) +
+      " " +
+      pad(date.getHours()) +
+      ":" +
+      pad(date.getMinutes())
+    );
+  }
+
+  const qrValue = issued && issued.payload ? issued.payload : "";
+
+  return h(
+    "div",
+    null,
+    error ? h(Alert, { type: "error", showIcon: true, message: error, style: { marginBottom: 16 } }) : null,
+    h(
+      Alert,
+      {
+        type: "warning",
+        showIcon: true,
+        style: { marginBottom: 16 },
+        message: "二维码等同于凭据，请勿截图外传。",
+        description:
+          "令牌在生成时显示一次，关闭后无法再次查看。服务端开启反向代理的 Basic 验证时，令牌会随请求出现在访问日志中。",
+      },
+    ),
+    h(
+      Field,
+      { label: "有效期", hint: "到期后需要重新生成。长期令牌不会自动失效，泄露风险最高。" },
+      h(
+        Radio.Group,
+        {
+          value: days,
+          onChange: (event) => setDays(event.target.value),
+          optionType: "button",
+        },
+        h(Radio.Button, { value: 7 }, "7 天"),
+        h(Radio.Button, { value: 30 }, "30 天"),
+        h(Radio.Button, { value: 90 }, "90 天"),
+        h(Radio.Button, { value: 0 }, "长期"),
+      ),
+    ),
+    h(
+      Field,
+      { label: "服务器地址", hint: "一行一个。第一条为默认地址，其余作为备用按顺序回退。" },
+      h(Input.TextArea, {
+        rows: 2,
+        value: addressText,
+        onChange: (event) => setAddressText(event.target.value),
+        placeholder: "http://192.168.1.10:8088",
+      }),
+    ),
+    h(
+      Field,
+      { label: "用途说明（可选）", hint: "只写进登记表，便于以后辨认是哪台设备。" },
+      h(Input, {
+        value: label,
+        maxLength: 64,
+        onChange: (event) => setLabel(event.target.value),
+        placeholder: "例如：主力手机",
+      }),
+    ),
+    h(Button, { type: "primary", loading: issuing, onClick: issue }, "生成配对码"),
+    issued
+      ? h(
+          "div",
+          { style: { marginTop: 20 } },
+          h("div", { style: { fontWeight: 500, marginBottom: 8 } }, "配对二维码"),
+          qrValue && antd.QRCode
+            ? h(antd.QRCode, { value: qrValue, size: 200 })
+            : issued.qrcode_img
+              ? h("img", {
+                  alt: "配对二维码",
+                  width: 200,
+                  src: "data:image/png;base64," + issued.qrcode_img,
+                })
+              : h(Text, { type: "secondary" }, "二维码图片生成失败，请使用下方令牌。"),
+          h(
+            Text,
+            { type: "secondary", style: { display: "block", margin: "12px 0 6px" } },
+            "访问令牌（仅显示一次）",
+          ),
+          h(Input.TextArea, { rows: 3, readOnly: true, value: issued.token || "" }),
+          h(
+            Button,
+            { style: { marginTop: 8 }, onClick: copyToken },
+            "复制令牌",
+          ),
+        )
+      : null,
+    h(Divider, null),
+    h(
+      "div",
+      { style: { display: "flex", alignItems: "center", marginBottom: 8 } },
+      h("div", { style: { fontWeight: 500 } }, "已签发的令牌"),
+      h(
+        Button,
+        { type: "link", size: "small", onClick: loadList, style: { marginLeft: 8 } },
+        "刷新",
+      ),
+    ),
+    listed && items.length === 0
+      ? h(Text, { type: "secondary" }, "暂无记录。服务端未启用 Web 登录时不会签发令牌。")
+      : null,
+    items.length
+      ? h(
+          "div",
+          null,
+          ...items.map((item) =>
+            h(
+              "div",
+              {
+                key: item.jti,
+                style: {
+                  display: "flex",
+                  alignItems: "center",
+                  padding: "8px 0",
+                  borderBottom: "1px solid rgba(0,0,0,0.06)",
+                },
+              },
+              h(
+                "div",
+                { style: { flex: 1 } },
+                h("div", null, item.label || "未命名"),
+                h(
+                  Text,
+                  { type: "secondary", style: { fontSize: 12 } },
+                  "到期：" +
+                    expiryText(item.expires_at) +
+                    " · 签发：" +
+                    expiryText(item.issued_at) +
+                    (item.revoked ? " · 已吊销" : ""),
+                ),
+              ),
+              editing && editing.jti === item.jti
+                ? h(
+                    "div",
+                    { style: { display: "flex", alignItems: "center", gap: 8 } },
+                    h(Input, {
+                      size: "small",
+                      value: editing.label,
+                      maxLength: 64,
+                      style: { width: 160 },
+                      onChange: (event) =>
+                        setEditing({ jti: item.jti, label: event.target.value }),
+                    }),
+                    h(
+                      Button,
+                      {
+                        type: "primary",
+                        size: "small",
+                        onClick: () => rename(item.jti, editing.label.trim()),
+                      },
+                      "保存",
+                    ),
+                    h(Button, { size: "small", onClick: () => setEditing(null) }, "取消"),
+                  )
+                : item.revoked
+                  ? h(
+                      "div",
+                      { style: { display: "flex", alignItems: "center", gap: 8 } },
+                      h(Text, { type: "secondary", style: { fontSize: 12 } }, "已吊销"),
+                      h(
+                        Button,
+                        { danger: true, size: "small", onClick: () => remove(item.jti) },
+                        "删除",
+                      ),
+                    )
+                  : h(
+                      "div",
+                      { style: { display: "flex", alignItems: "center", gap: 8 } },
+                      h(
+                        Button,
+                        {
+                          size: "small",
+                          onClick: () => setEditing({ jti: item.jti, label: item.label || "" }),
+                        },
+                        "改名",
+                      ),
+                      h(
+                        Button,
+                        { danger: true, size: "small", onClick: () => revoke(item.jti) },
+                        "吊销",
+                      ),
+                    ),
+            ),
+          ),
+        )
+      : null,
+  );
+}
+
+/**
  * 插件设置页外壳。
  *
  * 菜单项只有一个（「QwenPaw Node Bridge」），页内按功能分块：目前只有 SSH 中继，
@@ -353,6 +664,12 @@ function SshSettingsPanel() {
  * `id` 用作锚点与折叠状态，改名会丢失用户已展开与否的偏好，因此保持稳定。
  */
 const BLOCKS = [
+  {
+    id: "pairing",
+    title: "设备配对",
+    description: "签发手机端登录用的访问令牌，并显示可直接扫描的二维码。",
+    render: () => h(PairingPanel),
+  },
   {
     id: "ssh",
     title: "SSH 中继",
@@ -408,6 +725,10 @@ if (!window.__qwenpawNodeBridgeSshRoute) {
     {
       path: "/plugin/qwenpaw-node-bridge/ssh",
       label: "QwenPaw Node Bridge",
+      // 2.3.0 的 registerRoutes 读顶层 title 生成路由 meta；2.2.2 读 meta.title。
+      // 两处都给，跨版本都能显示正确的浏览器标题（缺省会回落成路径末段 “Ssh”）。
+      title: "QwenPaw Node Bridge",
+      meta: { title: "QwenPaw Node Bridge" },
       icon: h(BridgeIcon),
       component: BridgeSettingsPage,
       priority: 10,

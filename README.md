@@ -17,6 +17,7 @@
 | v0.4.0 | `WS /ssh`、`GET /ssh/config`、`GET /ssh/credential`、`GET/PUT /ssh/settings`，控制台设置面板 | `ssh` |
 | v0.4.1 | 认证策略调整（未开 Web 认证时按私有/受信任来源放行）、Console 路由改名、修双 `/api` 前缀 404；无新端点 | 同上 |
 | v0.4.2 | 设置页分块与菜单图标；无新端点 | 同上 |
+| v0.4.3 | `POST/GET /pairing/tokens`、`POST /pairing/tokens/{jti}/revoke`、`PATCH/DELETE /pairing/tokens/{jti}`，控制台「设备配对」面板 | `pairing` |
 
 **客户端只按 `capabilities` 里的名字开关功能，不比对版本号**，`plugin_version`只用于展示与排查。字段改名不改变 `capabilities`，但会破坏旧客户端的解析，发版说明必须写明。
 
@@ -86,6 +87,24 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 连接后先发 `ready`，随后各发一次 `inbox` 与 `approval` 的当前值，此后只在数值变化时推送；插件每 2.5 秒在连接内部轮询，客户端断开即退出生成器。
 
 **不包含定时任务。** `CronManager` 按 workspace 隔离，取摘要需要请求上下文里的智能体标识，而事件生成器里没有 `Request`，客户端的定时任务仍走轮询。
+
+## v0.4.3：设备配对
+
+为手机端签发访问令牌：`POST /pairing/tokens` 生成一枚专用令牌并返回配对二维码载荷与 PNG；
+`GET /pairing/tokens` 列出已签发令牌（只含元数据）；`POST /pairing/tokens/{jti}/revoke` 按 jti 吊销；
+`PATCH /pairing/tokens/{jti}` 改登记名（已吊销的拒绝），`DELETE /pairing/tokens/{jti}` 删除已吊销的条目。
+控制台设置页「设备配对」排在「SSH 中继」之前，可改名、吊销与删除已吊销条目。
+路由同时写了顶层 `title` 与 `meta.title`：2.3.0 的 `registerRoutes` 读前者生成路由元数据，
+2.2.2 读后者；缺省会回落到路径末段（`/ssh` 显示成 “Ssh”）。
+控制台设置页新增「设备配对」块：可选 7 / 30 / 90 天或长期，填写服务器地址后生成二维码，
+令牌只显示一次，可复制；下方列表可逐个吊销。
+
+- 登记表 `pairing_tokens.json` **不存令牌原文**，只有 jti、用户名、签发与到期时间、是否已吊销。
+- 按 jti 吊销依赖核心内部的 `_add_to_revocation_list`（`revoke_token` 用的就是它）；核心改名时
+  接口回 `immediate: false`，本地记录仍标记吊销，令牌到期自然失效。因此依赖核心 ≥ 2.2.2。
+- 服务端未启用 Web 登录时签发回 409，列表返回空——此时令牌不被校验，签了也没有意义。
+- 配对码格式 `qwenpaw-node://pair?v=1&addr=…&token=…`，与客户端 `PairQr` 对应，
+  样例与约定见客户端 `docs/protocol.md` 第 37 节。
 
 ## v0.4.2：设置页分块与菜单图标
 

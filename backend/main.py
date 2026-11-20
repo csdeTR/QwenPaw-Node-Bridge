@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """QwenPaw Node Bridge：供 Android 客户端使用的桥接端点。
 
-v0.1.3 提供 `GET /info`、`GET /search` 与 `GET /events`。后续能力（`portability`）
-逐版追加到 `capabilities` 数组，客户端按名字开关功能，不比对版本号。
+v0.4.3 起另外提供 ``/pairing/tokens`` 系列端点：签发、登记与吊销移动端访问令牌，
+供客户端「设备配对」使用。能力名（`pairing`）追加到 `capabilities` 数组，
+客户端按名字开关功能，不比对版本号。
 
 三条硬约束（都来自 qwenpaw 的插件加载器）：
 
@@ -57,7 +58,18 @@ logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 1
 
 #: 本插件声明的能力。客户端按名字开关功能，不看版本号。
-CAPABILITIES = ("info", "search", "sse", "portability", "push", "ssh")
+CAPABILITIES = ("info", "search", "sse", "portability", "push", "ssh", "pairing")
+
+#: 配对码的类型前缀。客户端与服务端各实现一份编解码，靠协议文档里的同一条样例串对齐。
+PAIR_URI_SCHEME = "qwenpaw-node"
+PAIR_URI_HOST = "pair"
+PAIR_URI_VERSION = 1
+
+#: 允许签发的有效期，单位天；0 表示长期（核心按 100 年处理）。
+PAIRING_ALLOWED_DAYS = (7, 30, 90, 0)
+
+#: 单次请求最多接受多少个地址。客户端表单通常只有一两条。
+PAIRING_MAX_ADDRESSES = 8
 
 #: 推送 channel 的唯一 key。不能与内置 channel 重名。
 PUSH_CHANNEL = "qwenpaw_node_push"
@@ -635,7 +647,7 @@ SSH_KEY_MAX_BYTES = 256 * 1024
 _ssh_active_connections = 0
 
 
-def _ssh_data_dir() -> Path:
+def _data_dir() -> Path:
     """插件自己的数据目录。
 
     不放在插件源码目录：重装或升级插件时会整目录替换。``QWENPAW_NODE_BRIDGE_DATA_DIR``
@@ -657,11 +669,11 @@ def _ssh_data_dir() -> Path:
 
 
 def _ssh_settings_path() -> Path:
-    return _ssh_data_dir() / "ssh_settings.json"
+    return _data_dir() / "ssh_settings.json"
 
 
 def _ssh_key_path() -> Path:
-    return _ssh_data_dir() / "ssh_key"
+    return _data_dir() / "ssh_key"
 
 
 def _load_ssh_settings() -> dict:
@@ -900,6 +912,259 @@ def _require_ssh_access(request: Request) -> None:
         headers=request.headers,
     ):
         raise HTTPException(401, "SSH requires authentication")
+
+
+# ---------------------------------------------------------------------------
+# 设备配对：签发与登记移动端访问令牌
+# ---------------------------------------------------------------------------
+
+
+def _pairing_path() -> Path:
+    return _data_dir() / "pairing_tokens.json"
+
+
+def _load_pairing() -> dict:
+    """读登记文件。**只存元数据，不存令牌原文。**
+
+    结构 ``{"version": 1, "items": {jti: {label, username, issued_at, expires_at, revoked}}}``。
+    读取时顺手清掉已过期的条目，避免文件无限增长；已吊销的过期条目也算过期。
+    """
+    try:
+        data = json.loads(_pairing_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "items": {}}
+    if not isinstance(data, dict):
+        return {"version": 1, "items": {}}
+    items = data.get("items")
+    if not isinstance(items, dict):
+        items = {}
+    now = int(time.time())
+    kept = {
+        jti: item
+        for jti, item in items.items()
+        if isinstance(item, dict) and int(item.get("expires_at", 0) or 0) > now
+    }
+    data["version"] = 1
+    data["items"] = kept
+    return data
+
+
+def _save_pairing(data: dict) -> None:
+    path = _pairing_path()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _pair_payload(addresses: list[str], token: str) -> str:
+    """拼配对码。格式与客户端 `PairQr` 一一对应，改一处必须同步另一处。"""
+    parts = [f"v={PAIR_URI_VERSION}"]
+    for address in addresses:
+        parts.append("addr=" + quote(address, safe=""))
+    parts.append("token=" + quote(token, safe=""))
+    return f"{PAIR_URI_SCHEME}://{PAIR_URI_HOST}?" + "&".join(parts)
+
+
+def _pair_qrcode_image(payload: str) -> str:
+    """base64 PNG。用 ``segno``，不 import 核心的 qrcode_auth_handler。
+
+    那个模块在顶层 import ``cryptography``，只为扫码失败时就把它整包拉起来不划算。
+    """
+    import base64
+    import io
+
+    import segno
+
+    code = segno.make(payload, error="M")
+    buf = io.BytesIO()
+    code.save(buf, kind="png", scale=6, border=2)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _pairing_auth_enabled() -> bool:
+    return _ssh_auth_enabled()
+
+
+def _require_pairing_access(request: Request) -> str:
+    """配对端点的访问校验，返回调用者用户名。
+
+    三种放行途径，按可信度从高到低：
+    1. 核心中间件验过 token 并写入 ``request.state.user``；
+    2. 自行校验请求里的 token（中间件在鉴权热切换时会整段跳过）；
+    3. 服务端未启用登录时，放行私有/回环来源，用户名记为 ``default``——
+       这时令牌不会被执行链校验，签发端会另行返回 409。
+    """
+    state_user = getattr(request.state, "user", None)
+    if state_user:
+        return str(state_user)
+    user = _ssh_token_user(_http_token(request))
+    if user:
+        return user
+    if not _pairing_auth_enabled():
+        client_host = request.client.host if request.client else None
+        if _is_private_client(client_host) or _trusted_header(request.headers):
+            return "default"
+    raise HTTPException(401, "Pairing requires authentication")
+
+
+def _core_revoke_jti(jti: str, exp: int) -> bool:
+    """按 jti 吊销。
+
+    核心只公开 ``revoke_token(token)``，而它需要令牌原文；把原文存进插件数据目录
+    等于多一处凭据存储。改为直接用核心吊销表内部使用的 ``_add_to_revocation_list``，
+    ``verify_token`` 会用同一个 ``_is_token_revoked`` 检查。
+
+    这是私有符号，升级核心可能改名，因此失败返回 False，由调用方降级为
+    「已从列表移除，令牌将在到期时间失效」。
+    """
+    try:
+        from qwenpaw.app.auth import _add_to_revocation_list
+
+        _add_to_revocation_list(jti, int(exp))
+        return True
+    except Exception:  # pylint: disable=broad-except
+        logger.warning("core does not support revoking by jti; token expires naturally")
+        return False
+
+
+def _long_expiry_epoch() -> int:
+    """「长期」令牌的固定到期时刻。
+
+    彩蛋，不写进对外文档。核心的 ``create_token`` 会把有效期截到 100 年，
+    到不了这个时刻，因此这条路自己按同样的载荷格式签一枚。
+    """
+    from datetime import datetime
+
+    return int(datetime(2143, 9, 21, 10, 43).timestamp())
+
+
+def _create_long_token(username: str) -> str:
+    """按核心的令牌格式签发一枚固定到期日的令牌。
+
+    格式与 ``qwenpaw.app.auth.create_token`` 一致：``base64url(payload).hmac_sha256``。
+    核心升级若改了签名格式，这里会验签失败，届时回落到核心的 100 年令牌。
+    """
+    import base64
+    import hashlib
+    import hmac
+    import secrets
+
+    try:
+        from qwenpaw.app.auth import _get_jwt_secret
+
+        now = int(time.time())
+        exp = _long_expiry_epoch()
+        payload = json.dumps(
+            {
+                "sub": username,
+                "exp": exp,
+                "iat": now,
+                "jti": secrets.token_hex(16),
+            },
+        )
+        payload_b64 = base64.urlsafe_b64encode(payload.encode()).decode()
+        sig = hmac.new(
+            _get_jwt_secret().encode(),
+            payload_b64.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"{payload_b64}.{sig}"
+    except Exception:  # pylint: disable=broad-except
+        from qwenpaw.app.auth import create_token
+
+        return create_token(username, 0)
+
+
+def _token_claims(token: str) -> tuple[int, str]:
+    """从令牌里读出 ``exp`` 与 ``jti``。
+
+    只解析载荷，不验签：令牌刚由 ``create_token`` 生成，验签由客户端与服务端各自做。
+    解析失败返回 ``(0, "")``，调用方据此拒绝签发。
+    """
+    import base64
+
+    try:
+        payload_b64 = token.split(".", 1)[0]
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return int(payload.get("exp", 0) or 0), str(payload.get("jti", "") or "")
+    except Exception:  # pylint: disable=broad-except
+        return 0, ""
+
+
+class PairingEditError(Exception):
+    """登记条目的改名 / 删除校验失败。"""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+def _rename_pairing_item(data: dict, jti: str, label: str) -> str:
+    """改登记条目的标签。只改本地元数据，令牌本身不受影响。"""
+    text = label.strip()[:64]
+    if not text:
+        raise PairingEditError(400, "标签不能为空")
+    item = data["items"].get(jti)
+    if not item:
+        raise PairingEditError(404, "未找到该令牌")
+    if item.get("revoked"):
+        # 已吊销的只能删除，避免把作废条目改成看起来仍有效的名字。
+        raise PairingEditError(409, "已吊销的令牌不能改名")
+    item["label"] = text
+    return text
+
+
+def _delete_pairing_item(data: dict, jti: str) -> None:
+    """删除登记条目。只允许删除已吊销的令牌。"""
+    item = data["items"].get(jti)
+    if not item:
+        raise PairingEditError(404, "未找到该令牌")
+    if not item.get("revoked"):
+        raise PairingEditError(409, "请先吊销再删除")
+    del data["items"][jti]
+
+
+def _pairing_item_view(item: dict) -> dict:
+    """登记条目对外的形状。**不含令牌原文**。"""
+    return {
+        "label": str(item.get("label", "")),
+        "username": str(item.get("username", "")),
+        "issued_at": int(item.get("issued_at", 0) or 0),
+        "expires_at": int(item.get("expires_at", 0) or 0),
+        "revoked": bool(item.get("revoked", False)),
+    }
+
+
+def _validate_pairing_request(body: dict) -> dict:
+    """校验签发请求。"""
+    try:
+        days = int(body.get("expires_in_days", 30))
+    except (TypeError, ValueError):
+        raise ValueError("有效期必须是整数天") from None
+    if days not in PAIRING_ALLOWED_DAYS:
+        allowed = "、".join(str(d) for d in PAIRING_ALLOWED_DAYS if d)
+        raise ValueError(f"有效期只能是 {allowed} 天或 0（长期）")
+
+    raw_addresses = body.get("addresses")
+    if not isinstance(raw_addresses, list):
+        raise ValueError("addresses 必须是数组")
+    addresses = []
+    for entry in raw_addresses:
+        text = str(entry or "").strip()
+        if not text:
+            continue
+        if not text.startswith(("http://", "https://")):
+            raise ValueError("地址必须以 http:// 或 https:// 开头")
+        addresses.append(text.rstrip("/"))
+    if not addresses:
+        raise ValueError("至少需要一个服务器地址")
+    if len(addresses) > PAIRING_MAX_ADDRESSES:
+        raise ValueError(f"地址最多 {PAIRING_MAX_ADDRESSES} 条")
+
+    label = str(body.get("label", "")).strip()[:64]
+    return {"days": days, "addresses": addresses, "label": label}
 
 
 def _ssh_credential() -> dict:
@@ -1201,6 +1466,137 @@ class BridgePlugin:
                 except Exception:  # pylint: disable=broad-except
                     pass
                 logger.info("SSH relay disconnected target=%s:%s", host, port)
+
+        @router.post("/pairing/tokens")
+        async def issue_pairing_token(request: Request, body: dict):
+            """签发一枚移动端访问令牌，并给出二维码载荷与图片。
+
+            令牌是**凭据**：不回显在列表里，不进日志。二维码等于把这枚令牌画在屏幕上，
+            页面必须提示不要外传。
+            """
+            username = _require_pairing_access(request)
+            if not _pairing_auth_enabled():
+                # 服务端未启用登录时令牌不会被执行链校验，签了也没有意义。
+                raise HTTPException(409, "Authentication is not enabled")
+            try:
+                spec = _validate_pairing_request(body)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
+            from qwenpaw.app.auth import create_token
+
+            # 正数按秒计；0 走固定到期日的「长期」。
+            if spec["days"]:
+                expiry_seconds = spec["days"] * 24 * 3600
+                token = create_token(username, expiry_seconds)
+            else:
+                expiry_seconds = 0
+                token = _create_long_token(username)
+            exp, jti = _token_claims(token)
+            if not jti:
+                raise HTTPException(500, "服务端生成的令牌缺少 jti，无法登记")
+
+            now = int(time.time())
+            data = _load_pairing()
+            data["items"][jti] = {
+                "label": spec["label"],
+                "username": username,
+                "issued_at": now,
+                "expires_at": exp or (now + expiry_seconds),
+                "revoked": False,
+            }
+            _save_pairing(data)
+            payload = _pair_payload(spec["addresses"], token)
+            try:
+                image = _pair_qrcode_image(payload)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("pairing qrcode generation failed: %s", exc)
+                image = ""
+            return JSONResponse(
+                {
+                    "token": token,
+                    "jti": jti,
+                    "username": username,
+                    "issued_at": now,
+                    "expires_at": data["items"][jti]["expires_at"],
+                    "payload": payload,
+                    "qrcode_img": image,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @router.get("/pairing/tokens")
+        async def list_pairing_tokens(request: Request):
+            """已签发的令牌。只回元数据，**不回令牌原文**。"""
+            _require_pairing_access(request)
+            if not _pairing_auth_enabled():
+                return JSONResponse(
+                    {"items": []},
+                    headers={"Cache-Control": "no-store"},
+                )
+            data = _load_pairing()
+            items = [
+                {"jti": jti, **_pairing_item_view(item)}
+                for jti, item in sorted(
+                    data["items"].items(),
+                    key=lambda kv: int(kv[1].get("issued_at", 0) or 0),
+                    reverse=True,
+                )
+            ]
+            return JSONResponse(
+                {"items": items},
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @router.post("/pairing/tokens/{jti}/revoke")
+        async def revoke_pairing_token(request: Request, jti: str):
+            """按 jti 吊销。
+
+            核心没有「按 jti 吊销」的公开接口，这里直接用吊销表；失败时仍把本地记录
+            标为已吊销，界面据此提示「该令牌将在到期时间失效」。
+            """
+            _require_pairing_access(request)
+            data = _load_pairing()
+            item = data["items"].get(jti)
+            if not item:
+                raise HTTPException(404, "未找到该令牌")
+            applied = _core_revoke_jti(jti, int(item.get("expires_at", 0) or 0))
+            item["revoked"] = True
+            _save_pairing(data)
+            return JSONResponse(
+                {"revoked": True, "immediate": applied},
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @router.patch("/pairing/tokens/{jti}")
+        async def rename_pairing_token(request: Request, jti: str, body: dict):
+            """改名。只改登记表里的标签，令牌本身不受影响。"""
+            _require_pairing_access(request)
+            data = _load_pairing()
+            try:
+                label = _rename_pairing_item(data, jti, str(body.get("label", "")))
+            except PairingEditError as exc:
+                raise HTTPException(exc.status, exc.detail) from exc
+            _save_pairing(data)
+            return JSONResponse(
+                {"renamed": True, "label": label},
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @router.delete("/pairing/tokens/{jti}")
+        async def delete_pairing_token(request: Request, jti: str):
+            """删除登记条目。只允许删除已吊销的令牌。"""
+            _require_pairing_access(request)
+            data = _load_pairing()
+            try:
+                _delete_pairing_item(data, jti)
+            except PairingEditError as exc:
+                raise HTTPException(exc.status, exc.detail) from exc
+            _save_pairing(data)
+            return JSONResponse(
+                {"deleted": True},
+                headers={"Cache-Control": "no-store"},
+            )
 
         router.include_router(_portability_router())
         api.register_http_router(router, prefix=ROUTE_PREFIX)

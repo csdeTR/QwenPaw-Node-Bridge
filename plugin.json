@@ -1,6 +1,6 @@
 {
   "id": "qwenpaw-node-bridge",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "name": "QwenPaw Node Bridge",
   "description": "为 QwenPaw Node Android 客户端提供桥接端点",
   "author": "QwenPaw Node",
@@ -17,7 +17,8 @@
       "sse",
       "portability",
       "push",
-      "ssh"
+      "ssh",
+      "pairing"
     ]
   }
 }
