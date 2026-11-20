@@ -7,7 +7,7 @@ const host = window.QwenPaw.host;
 const React = host.React;
 const antd = host.antd;
 const h = React.createElement;
-const { Alert, Button, Card, Checkbox, Divider, Input, InputNumber, Radio, Space, Typography, message } = antd;
+const { Alert, Button, Card, Checkbox, Divider, Input, InputNumber, Radio, Select, Space, Switch, Typography, message } = antd;
 const Text = Typography.Text;
 const Paragraph = Typography.Paragraph;
 
@@ -37,6 +37,11 @@ function BridgeIcon() {
 // host.getApiUrl 会自行补上 /api 前缀，这里不能再带，否则请求会变成 /api/api/...
 const SSH_API_PATH = "/plugins/qwenpaw-node-bridge/ssh/settings";
 const PAIRING_API_PATH = "/plugins/qwenpaw-node-bridge/pairing/tokens";
+const LOGS_API_PATH = "/plugins/qwenpaw-node-bridge/logs";
+const UPDATE_STATUS_PATH = "/plugins/qwenpaw-node-bridge/update/status";
+const UPDATE_SETTINGS_PATH = "/plugins/qwenpaw-node-bridge/update/settings";
+const UPDATE_CHECK_PATH = "/plugins/qwenpaw-node-bridge/update/check";
+const UPDATE_REPO_URL = "https://github.com/csdeTR/QwenPaw-Node-Bridge";
 
 async function request(path, method, body, options) {
   const headers = {};
@@ -656,6 +661,439 @@ function PairingPanel() {
   );
 }
 
+// 插件日志的行首格式由后端 handler 决定：`2026-11-21 10:00:00,123 LEVEL 正文`。
+// 续行（堆栈、多行文本）没有时间戳，沿用上一行的时间与分类。
+const LOG_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}),(\d{3})/;
+
+// 时间段与功能点的取值。0 表示不限时间；分类值同时用作 Select 的 key。
+const LOG_RANGE_OPTIONS = [
+  { value: 1, label: "1 小时" },
+  { value: 24, label: "24 小时" },
+  { value: 168, label: "7 天" },
+  { value: 0, label: "全部" },
+];
+
+const LOG_CATEGORY_OPTIONS = [
+  { value: "all", label: "全部" },
+  { value: "settings", label: "设置" },
+  { value: "ssh", label: "SSH" },
+  { value: "pairing", label: "配对" },
+  { value: "browser", label: "浏览器" },
+  { value: "update", label: "更新" },
+  { value: "push", label: "推送" },
+  { value: "other", label: "其他" },
+];
+
+// 分类只看关键字。顺序有意义：`SSH settings updated` 既是 SSH 也是设置，
+// 归到 SSH 更能说明是哪块在动。
+function classifyLogLine(line) {
+  const lower = line.toLowerCase();
+  if (lower.includes("ssh relay") || lower.includes("ssh settings")) return "ssh";
+  if (lower.includes("pairing")) return "pairing";
+  if (lower.includes("browser")) return "browser";
+  if (lower.includes("[update]")) return "update";
+  if (lower.includes("push")) return "push";
+  if (lower.includes("registered") || lower.includes("settings updated")) return "settings";
+  return "other";
+}
+
+// 把原始行变成可筛选的条目。时间解析成本地时间：日志由服务端本地时钟写入，
+// 浏览器与服务端通常同机或同时区。
+function buildLogEntries(lines) {
+  let lastAt = 0;
+  let lastCategory = "other";
+  return lines.map((line) => {
+    const match = LOG_TIMESTAMP.exec(line);
+    if (!match) {
+      return { text: line, at: lastAt, category: lastCategory, timestamped: false };
+    }
+    const at = new Date(
+      Number(match[1]),
+      Number(match[2]) - 1,
+      Number(match[3]),
+      Number(match[4]),
+      Number(match[5]),
+      Number(match[6]),
+      Number(match[7]),
+    ).getTime();
+    lastAt = Number.isNaN(at) ? lastAt : at;
+    lastCategory = classifyLogLine(line);
+    return { text: line, at: lastAt, category: lastCategory, timestamped: true };
+  });
+}
+
+/**
+ * 插件日志面板。
+ *
+ * 只看最近若干行，不做下载；内容由后端按行脱敏，前端不再二次处理。
+ * 筛选全在前端做：一次取回 300 行，切换筛选条件不重新请求。
+ */
+function LogsPanel() {
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const [lines, setLines] = React.useState([]);
+  const [truncated, setTruncated] = React.useState(false);
+  const [rangeHours, setRangeHours] = React.useState(0);
+  const [category, setCategory] = React.useState("all");
+  const [keyword, setKeyword] = React.useState("");
+
+  const load = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await request(LOGS_API_PATH + "?lines=300", "GET");
+      setLines(Array.isArray(data.lines) ? data.lines : []);
+      setTruncated(Boolean(data.truncated));
+    } catch (e) {
+      setError(String(e && e.message ? e.message : e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  React.useEffect(() => {
+    load();
+  }, []);
+
+  const entries = buildLogEntries(lines);
+  const cutoff = rangeHours > 0 ? Date.now() - rangeHours * 3600 * 1000 : 0;
+  const needle = keyword.trim().toLowerCase();
+  const visible = entries.filter((entry) => {
+    if (cutoff > 0 && (!entry.at || entry.at < cutoff)) return false;
+    if (category !== "all" && entry.category !== category) return false;
+    if (needle && !entry.text.toLowerCase().includes(needle)) return false;
+    return true;
+  });
+
+  return h(
+    "div",
+    null,
+    h(
+      Space,
+      { style: { marginBottom: 12 }, wrap: true },
+      h(Button, { size: "small", loading, onClick: load }, "刷新"),
+      h(
+        Text,
+        { type: "secondary", style: { fontSize: 12 } },
+        "显示 " +
+          visible.length +
+          " / " +
+          lines.length +
+          " 行" +
+          (truncated ? "（已截断）" : ""),
+      ),
+    ),
+    h(
+      "div",
+      {
+        style: {
+          display: "flex",
+          flexWrap: "wrap",
+          gap: 8,
+          marginBottom: 12,
+        },
+      },
+      h(Select, {
+        size: "small",
+        value: rangeHours,
+        options: LOG_RANGE_OPTIONS,
+        style: { width: 120 },
+        onChange: (value) => setRangeHours(value),
+      }),
+      h(Select, {
+        size: "small",
+        value: category,
+        options: LOG_CATEGORY_OPTIONS,
+        style: { width: 120 },
+        onChange: (value) => setCategory(value),
+      }),
+      h(Input, {
+        size: "small",
+        allowClear: true,
+        value: keyword,
+        placeholder: "关键词",
+        style: { width: 200 },
+        onChange: (event) => setKeyword(event.target.value),
+      }),
+    ),
+    error
+      ? h(Alert, { type: "error", showIcon: true, message: error, style: { marginBottom: 12 } })
+      : null,
+    h(
+      "pre",
+      {
+        style: {
+          maxHeight: 360,
+          overflow: "auto",
+          background: "transparent",
+          border: "1px solid rgba(127,127,127,0.28)",
+          color: "inherit",
+          padding: 12,
+          borderRadius: 8,
+          fontSize: 12,
+          lineHeight: 1.5,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+          margin: 0,
+        },
+      },
+      visible.length
+        ? visible.map((entry) => entry.text).join("\n")
+        : lines.length
+          ? "当前筛选条件下没有日志。"
+          : "暂无日志。",
+    ),
+  );
+}
+
+// 页面加载时只弹一次新版本提示。模块级标记：切换分块、重新加载数据都不会重复弹。
+let updateNoticeShown = false;
+
+function formatEpochText(epochSeconds) {
+  if (!epochSeconds) return "尚未检查";
+  const date = new Date(epochSeconds * 1000);
+  if (Number.isNaN(date.getTime())) return "尚未检查";
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    date.getFullYear() +
+    "-" +
+    pad(date.getMonth() + 1) +
+    "-" +
+    pad(date.getDate()) +
+    " " +
+    pad(date.getHours()) +
+    ":" +
+    pad(date.getMinutes())
+  );
+}
+
+function AboutRow(props) {
+  return h(
+    "div",
+    { style: { display: "flex", gap: 12, marginBottom: 6, fontSize: 13 } },
+    h("div", { style: { width: 96, opacity: 0.65 } }, props.label),
+    h("div", { style: { flex: 1 } }, props.children),
+  );
+}
+
+/**
+ * 「关于」块：版本信息、每日检查设置与手动检查。
+ *
+ * 检查由服务端定时任务执行（每天 HH:MM，启动时若已过点会补查），这里只读写
+ * 设置并触发一次立即检查；请求失败时保留上次成功结论，`error` 单独显示。
+ */
+function AboutPanel() {
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+  const [checking, setChecking] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const [status, setStatus] = React.useState(null);
+  const [form, setForm] = React.useState({
+    enabled: true,
+    check_time: "09:00",
+    notify_console: true,
+    notify_client: true,
+  });
+
+  const update = (patch) => setForm((current) => ({ ...current, ...patch }));
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await request(UPDATE_STATUS_PATH, "GET");
+      setStatus(data);
+      setForm({
+        enabled: Boolean(data.enabled),
+        check_time: data.check_time || "09:00",
+        notify_console: Boolean(data.notify_console),
+        notify_client: Boolean(data.notify_client),
+      });
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  React.useEffect(() => {
+    load();
+  }, []);
+
+  async function save() {
+    setError("");
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(form.check_time.trim())) {
+      setError("检查时间必须是 HH:MM 格式，例如 09:00");
+      return;
+    }
+    setSaving(true);
+    try {
+      await request(UPDATE_SETTINGS_PATH, "PUT", {
+        enabled: form.enabled,
+        check_time: form.check_time.trim(),
+        notify_console: form.notify_console,
+        notify_client: form.notify_client,
+      });
+      message.success("更新检查设置已保存");
+      await load();
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function checkNow() {
+    setError("");
+    setChecking(true);
+    try {
+      const data = await request(UPDATE_CHECK_PATH, "POST");
+      setStatus(data);
+      if (data.update_available) {
+        message.success("发现新版本 " + (data.latest_version || ""));
+      } else {
+        message.info("已是最新版本");
+      }
+    } catch (err) {
+      // 先刷新状态（服务端已把错误写进 state），再显示本次请求的错误：
+      // load() 会清空 error，顺序反过来会被立刻抹掉。
+      const text = String(err.message || err);
+      await load();
+      setError(text);
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  if (loading && !status) {
+    return h("div", null, h(Text, { type: "secondary" }, "正在读取版本信息…"));
+  }
+
+  const resultText = () => {
+    if (!status) return "未知";
+    if (status.update_available) {
+      return h(
+        "span",
+        null,
+        "发现新版本 " + (status.latest_version || "") + "，",
+        h(
+          "a",
+          {
+            href: status.latest_url || UPDATE_REPO_URL,
+            target: "_blank",
+            rel: "noreferrer",
+          },
+          "查看发行说明",
+        ),
+      );
+    }
+    if (status.latest_version) {
+      return "已是最新版本（最新 " + status.latest_version + "）";
+    }
+    return status.checked_at ? "已是最新版本" : "尚未检查";
+  };
+
+  return h(
+    "div",
+    null,
+    error
+      ? h(Alert, {
+          type: "error",
+          showIcon: true,
+          message: error,
+          style: { marginBottom: 12 },
+        })
+      : null,
+    status && status.error
+      ? h(Alert, {
+          type: "warning",
+          showIcon: true,
+          message: "上次检查失败",
+          description: status.error,
+          style: { marginBottom: 12 },
+        })
+      : null,
+    h(
+      AboutRow,
+      { label: "插件版本" },
+      (status && status.plugin_version) || "未知",
+    ),
+    h(
+      AboutRow,
+      { label: "协议版本" },
+      status && status.protocol_version ? String(status.protocol_version) : "未知",
+    ),
+    h(
+      AboutRow,
+      { label: "服务端版本" },
+      (status && status.server_version) || "未知",
+    ),
+    h(
+      AboutRow,
+      { label: "仓库" },
+      h(
+        "a",
+        {
+          href: (status && status.repo_url) || UPDATE_REPO_URL,
+          target: "_blank",
+          rel: "noreferrer",
+        },
+        UPDATE_REPO_URL,
+      ),
+    ),
+    h(
+      AboutRow,
+      { label: "最近检查" },
+      formatEpochText(status && status.checked_at),
+    ),
+    h(AboutRow, { label: "检查结果" }, resultText()),
+    h(Divider, null),
+    h(
+      Field,
+      {
+        label: "自动检查",
+        hint: "每天在下方时间检查一次；服务在该时间之后启动时，当天会补查一次。",
+      },
+      h(Switch, {
+        checked: form.enabled,
+        onChange: (checked) => update({ enabled: Boolean(checked) }),
+      }),
+    ),
+    h(
+      Field,
+      { label: "每日检查时间", hint: "24 小时制，格式 HH:MM，例如 09:00。" },
+      h(Input, {
+        value: form.check_time,
+        style: { width: 160 },
+        placeholder: "09:00",
+        onChange: (event) => update({ check_time: event.target.value }),
+      }),
+    ),
+    h(
+      Field,
+      { label: "Console 提示", hint: "打开控制台时，若有新版本会弹一次轻提示。" },
+      h(Switch, {
+        checked: form.notify_console,
+        onChange: (checked) => update({ notify_console: Boolean(checked) }),
+      }),
+    ),
+    h(
+      Field,
+      { label: "QP Node 提示", hint: "客户端读取同一份状态，按此开关决定是否提示。" },
+      h(Switch, {
+        checked: form.notify_client,
+        onChange: (checked) => update({ notify_client: Boolean(checked) }),
+      }),
+    ),
+    h(
+      Space,
+      null,
+      h(Button, { type: "primary", loading: saving, onClick: save }, "保存"),
+      h(Button, { loading: checking, onClick: checkNow }, "检查更新"),
+    ),
+  );
+}
+
 /**
  * 插件设置页外壳。
  *
@@ -676,10 +1114,42 @@ const BLOCKS = [
     description: "配置手机端「Bridge 中继」使用的 SSH 目标。",
     render: () => h(SshSettingsPanel),
   },
+  {
+    id: "logs",
+    title: "插件日志",
+    description: "查看设置变更、SSH 连接与修复动作的最近记录；内容已在服务端脱敏。",
+    render: () => h(LogsPanel),
+  },
+  {
+    id: "about",
+    title: "关于",
+    description: "查看插件与服务端版本，设置每日更新检查。",
+    render: () => h(AboutPanel),
+  },
 ];
 
 function BridgeSettingsPage() {
   const [openId, setOpenId] = React.useState(BLOCKS[0] ? BLOCKS[0].id : null);
+
+  // 页面加载时读一次状态，有新版本就弹一次轻提示。放在外壳而不是「关于」块里：
+  // 块只有展开时才挂载，放在块里会导致没展开就永远不提示。
+  React.useEffect(() => {
+    request(UPDATE_STATUS_PATH, "GET")
+      .then((status) => {
+        if (!status || !status.update_available || !status.notify_console) return;
+        if (updateNoticeShown) return;
+        updateNoticeShown = true;
+        message.info(
+          "QwenPaw Node Bridge 有新版本 " +
+            (status.latest_version || "") +
+            "，可在「关于」块查看",
+        );
+      })
+      .catch(() => {
+        // 更新状态读不到不影响设置页其它分块。
+      });
+  }, []);
+
   return h(
     "div",
     null,

@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
 """QwenPaw Node Bridge：供 Android 客户端使用的桥接端点。
 
+v0.5.0 起提供 ``/browser/logs`` 与 ``/browser/repair``：读取 NM host 日志并按行脱敏，
+把修复动作转发给官方 chrome 插件的 ``/setup``。能力名（`browser`）追加到
+`capabilities` 数组，客户端按名字开关功能，不比对版本号。
+
+同一版本追加 ``/update/status``、``/update/settings`` 与 ``/update/check``：按每天
+固定的 HH:MM 查 GitHub latest release，结果供 Console「关于」块与客户端提示使用。
+能力名（`update`）同样只追加到 `capabilities`，`protocol_version` 仍为 1。
+
 v0.4.3 起另外提供 ``/pairing/tokens`` 系列端点：签发、登记与吊销移动端访问令牌，
 供客户端「设备配对」使用。能力名（`pairing`）追加到 `capabilities` 数组，
 客户端按名字开关功能，不比对版本号。
@@ -26,10 +34,12 @@ import asyncio
 import ipaddress
 import json
 import logging
+import logging.handlers
 import os
 import re
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -58,7 +68,17 @@ logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 1
 
 #: 本插件声明的能力。客户端按名字开关功能，不看版本号。
-CAPABILITIES = ("info", "search", "sse", "portability", "push", "ssh", "pairing")
+CAPABILITIES = (
+    "info",
+    "search",
+    "sse",
+    "portability",
+    "push",
+    "ssh",
+    "pairing",
+    "browser",
+    "update",
+)
 
 #: 配对码的类型前缀。客户端与服务端各实现一份编解码，靠协议文档里的同一条样例串对齐。
 PAIR_URI_SCHEME = "qwenpaw-node"
@@ -668,6 +688,61 @@ def _data_dir() -> Path:
     return root
 
 
+#: 插件日志文件。设置变更、SSH 连接与修复动作都写到这里，供设置页查看。
+PLUGIN_LOG_MAX_BYTES = 512 * 1024
+PLUGIN_LOG_BACKUPS = 2
+_plugin_log_handler: logging.Handler | None = None
+
+
+def _plugin_log_path() -> Path:
+    return _data_dir() / "plugin.log"
+
+
+def _ensure_file_logging() -> None:
+    """把插件自己的日志写进数据目录，供设置页读取。
+
+    只挂在插件 logger 上，不碰根 logger；重复加载时复用已有 handler，
+    避免同一条记录写两遍。
+    """
+    global _plugin_log_handler  # pylint: disable=global-statement
+    if _plugin_log_handler is not None:
+        return
+    path = _plugin_log_path()
+    handler = logging.handlers.RotatingFileHandler(
+        path,
+        maxBytes=PLUGIN_LOG_MAX_BYTES,
+        backupCount=PLUGIN_LOG_BACKUPS,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    if logger.level == logging.NOTSET:
+        logger.setLevel(logging.INFO)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    _plugin_log_handler = handler
+
+
+def _tail_plugin_log(limit: int) -> tuple[list[str], bool]:
+    path = _plugin_log_path()
+    if not path.is_file():
+        return [], False
+    return _tail_log_lines(path, limit)
+
+
+def _require_logs_access(request: Request) -> None:
+    client_host = request.client.host if request.client else None
+    if not _ssh_access_allowed(
+        token=_http_token(request),
+        client_host=client_host,
+        headers=request.headers,
+    ):
+        raise HTTPException(401, "Plugin logs require authentication")
+
+
 def _ssh_settings_path() -> Path:
     return _data_dir() / "ssh_settings.json"
 
@@ -814,6 +889,13 @@ def _apply_ssh_settings(body: dict) -> dict:
         # 不再使用粘贴的私钥时删除它，避免多留一份明文。
         _delete_inline_key()
     _save_ssh_settings(data)
+    logger.info(
+        "SSH settings updated host=%s port=%s user=%s auth=%s",
+        data.get("host", ""),
+        data.get("port", 22),
+        data.get("user", ""),
+        data.get("auth", ""),
+    )
     return _masked_ssh_settings()
 
 
@@ -912,6 +994,22 @@ def _require_ssh_access(request: Request) -> None:
         headers=request.headers,
     ):
         raise HTTPException(401, "SSH requires authentication")
+
+
+def _require_browser_access(request: Request) -> None:
+    """浏览器端点的访问校验，策略与 SSH、pairing 相同。
+
+    修复端点会驱动服务端安装扩展资产与 NM host，属于写操作；日志端点可能含有
+    地址与内部标识。两者都不能依赖核心中间件：鉴权开关热切换时它会整段跳过。
+    开了 Web 登录时只认有效 token，没开时只放行私有/回环地址或受信任标记。
+    """
+    client_host = request.client.host if request.client else None
+    if not _ssh_access_allowed(
+        token=_http_token(request),
+        client_host=client_host,
+        headers=request.headers,
+    ):
+        raise HTTPException(401, "Browser endpoints require authentication")
 
 
 # ---------------------------------------------------------------------------
@@ -1204,10 +1302,817 @@ def _ssh_credential() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 浏览器控制链路：NM host 日志与修复转发
+# ---------------------------------------------------------------------------
+
+#: 客户端不传 lines 时返回多少行。
+BROWSER_LOG_DEFAULT_LINES = 200
+
+#: 单次最多返回多少行。日志可能很大，这里只截尾部。
+BROWSER_LOG_MAX_LINES = 2000
+
+#: 从文件尾部最多读多少字节。2000 行正常日志远小于这个值；设上限是为了避免
+#: 一份几百 MB 的日志把内存吃满。
+BROWSER_LOG_MAX_BYTES = 512 * 1024
+
+#: 日志相对 ``WORKING_DIR`` 的位置，由官方 NM host 写入。
+BROWSER_LOG_RELATIVE = ("logs", "nm-host.log")
+
+#: 官方 chrome 插件的 id，用于判断「插件是否已安装」与从目录取安装地址。
+CHROME_PLUGIN_ID = "chrome"
+
+#: 修复转发的目标。首选核心文档与插件源码确认的 ``/api/chrome/setup``；
+#: 插件路由由 ``register_http_router(prefix)`` 挂在 ``/api`` + prefix 下，
+#: 若该插件把 prefix 写成 ``/plugins/chrome``，则实际路径是后者，故留一个回退。
+CHROME_SETUP_PATHS = ("/api/chrome/setup", "/api/plugins/chrome/setup")
+
+#: 转发体。``unpacked`` 表示就地加载扩展目录，不写入 Chrome 商店扩展。
+CHROME_SETUP_BODY = {"install_mode": "unpacked", "reset": False}
+
+CHROME_PLUGINS_PATH = "/api/plugins"
+CHROME_CATALOG_PATH = "/api/plugins/catalog"
+
+#: ``POST /browser/repair`` 只接受的动作。其余一律 400。
+BROWSER_REPAIR_ACTIONS = ("setup",)
+
+#: 插件与核心同进程，走回环即可；端口读不到时才回落到核心的默认值。
+DEFAULT_API_PORT = 8088
+
+#: 自请求超时。setup 要落盘扩展资产与 NM host，比普通读接口慢。
+SELF_REQUEST_TIMEOUT = 20.0
+
+#: 脱敏替换结果。要求可逆性为零：原文一旦匹配就整体丢弃。
+REDACTED = "***"
+
+#: JSON 里以引号包裹的敏感键。放在最前：先整体吃掉值，后面的规则才不会被引号打断。
+_REDACT_JSON = re.compile(
+    r"(?i)(\"(?:authorization|proxy-authorization|cookie|set-cookie|token|"
+    r"access_token|refresh_token|api_key|apikey|x-api-key|secret|password|passphrase)\""
+    r"\s*:\s*)\"(?:[^\"\\]|\\.)*\"",
+)
+
+#: Cookie 头值含多个 ``k=v``，只遮第一个会漏，整段遮到行尾。
+_REDACT_COOKIE_HEADER = re.compile(
+    r"(?i)\b(set-cookie|cookie)\s*:\s*[^\r\n]*",
+)
+
+#: 只遮令牌本身，保留行内的其余字段（状态码、路径）便于排查。
+_REDACT_AUTH_HEADER = re.compile(
+    r"(?i)\b(proxy-authorization|authorization|x-api-key)\s*:\s*(?:bearer\s+)?[^\s,;]+",
+)
+
+#: 裸 ``Bearer`` / ``Basic`` 凭据，例如写在 URL、字典 repr 或错误文本里。
+_REDACT_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9\-._~+/]{8,}=*")
+
+#: 键值对形式：``token=``、``api_key=``、``secret=`` 等。
+_REDACT_PAIR = re.compile(
+    r"(?i)\b(access_token|refresh_token|api_key|apikey|token|secret|password|passphrase)"
+    r"\s*=\s*[^\s&,;\"']+",
+)
+
+
+def _working_dir() -> Path:
+    """服务端工作目录。日志写在它下面，而不是 ``Path.home()``。
+
+    ``WORKING_DIR`` 会跟随 ``QWENPAW_WORKING_DIR`` 或历史安装目录 ``~/.copaw``，
+    直接拼 ``~/.qwenpaw`` 在这两种部署里会读错文件。
+    """
+    try:
+        from qwenpaw.constant import WORKING_DIR
+
+        return Path(WORKING_DIR)
+    except Exception:  # pylint: disable=broad-except
+        return Path.home() / ".qwenpaw"
+
+
+def _nm_host_log_path() -> Path:
+    return _working_dir().joinpath(*BROWSER_LOG_RELATIVE)
+
+
+def _sanitize_log_line(line: str) -> str:
+    """按行脱敏。**只用于返回值，不用于日志**。
+
+    覆盖 Authorization / Bearer / Cookie / Set-Cookie / token= / api_key= /
+    X-Api-Key / secret= 这八类；整行返回，不做截断，客户端按原样显示。
+    """
+    text = _REDACT_JSON.sub(r'\1"' + REDACTED + '"', line)
+    text = _REDACT_COOKIE_HEADER.sub(r"\1: " + REDACTED, text)
+    text = _REDACT_AUTH_HEADER.sub(r"\1: " + REDACTED, text)
+    text = _REDACT_BEARER.sub(r"\1 " + REDACTED, text)
+    text = _REDACT_PAIR.sub(r"\1=" + REDACTED, text)
+    return text
+
+
+def _tail_log_lines(path: Path, limit: int) -> tuple[list[str], bool]:
+    """读文件末尾最多 ``limit`` 行，返回 ``(行, 是否被截断)``。
+
+    只从尾部读 ``BROWSER_LOG_MAX_BYTES`` 字节：按行遍历整份日志在日志轮转
+    之前会一次吃掉几百 MB。从中间开始时首行可能是半行，丢弃。
+    """
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        read_size = min(size, BROWSER_LOG_MAX_BYTES)
+        handle.seek(size - read_size)
+        raw = handle.read(read_size)
+
+    truncated = read_size < size
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if truncated and lines:
+        lines = lines[1:]
+    if len(lines) > limit:
+        lines = lines[-limit:]
+        truncated = True
+    return lines, truncated
+
+
+def _read_nm_host_log(limit: int) -> dict:
+    """返回给客户端的日志形状。文件不存在时抛 ``FileNotFoundError``。"""
+    path = _nm_host_log_path()
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    lines, truncated = _tail_log_lines(path, limit)
+    return {
+        "lines": [_sanitize_log_line(line) for line in lines],
+        "truncated": truncated,
+        "path": str(path),
+    }
+
+
+def _server_api_base() -> str:
+    """本机核心 API 的基地址，主机固定回环。
+
+    端口优先取核心进程内的 ``read_last_api()``：CLI 与桌面壳启动时都会
+    ``write_last_api``，与 ``/api/ws/chrome`` 的解析方式一致。取不到时再读环境
+    变量，最后才回落到 8088。主机不用 ``read_last_api`` 里的绑定地址：那是
+    ``0.0.0.0`` 或某块网卡，走回环既确定又不需要经过网卡。
+    """
+    port = None
+    try:
+        from qwenpaw.config.utils import read_last_api
+
+        info = read_last_api()
+        if info:
+            port = int(info[1])
+    except Exception:  # pylint: disable=broad-except
+        port = None
+    if port is None or not 0 < port < 65536:
+        port = None
+        for name in ("QWENPAW_API_PORT", "QWENPAW_PORT"):
+            raw = os.environ.get(name, "").strip()
+            if not raw:
+                continue
+            try:
+                candidate = int(raw)
+            except ValueError:
+                continue
+            if 0 < candidate < 65536:
+                port = candidate
+                break
+    if port is None:
+        port = DEFAULT_API_PORT
+    return f"http://127.0.0.1:{port}"
+
+
+def _self_headers(request: Request) -> dict:
+    """自请求的头部。
+
+    同一个 token 原样转发给 chrome 插件的路由：核心的 ``AuthMiddleware`` 会再验一次，
+    换成一个内部凭据等于绕过调用方的权限。未开鉴权时改发受信任标记，与
+    ``X-QwenPaw-Trusted-Host`` 的既有语义一致——该标记由客户端显式确认后携带。
+    """
+    headers = {"accept": "application/json"}
+    token = _http_token(request)
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    elif _trusted_header(request.headers):
+        headers[TRUSTED_HOST_HEADER] = "1"
+    agent_id = str(request.headers.get("x-agent-id", "")).strip()
+    if agent_id:
+        headers["x-agent-id"] = agent_id
+    return headers
+
+
+async def _self_request(
+    method: str,
+    path: str,
+    *,
+    headers: dict | None = None,
+    json_body: dict | None = None,
+) -> httpx.Response:
+    """向本机核心发一次请求。
+
+    ``trust_env=False``：环境里的 ``HTTP_PROXY`` 会让回环请求绕到代理，
+    表现为「端口通但读不到插件路由」。
+    """
+    async with httpx.AsyncClient(
+        timeout=SELF_REQUEST_TIMEOUT,
+        trust_env=False,
+    ) as client:
+        return await client.request(
+            method,
+            _server_api_base() + path,
+            headers=headers or {},
+            json=json_body,
+        )
+
+
+def _version_key(version: str) -> tuple:
+    """把 ``0.1.1`` 变成可比较的元组；非数字段直接忽略。"""
+    return tuple(int(part) for part in re.findall(r"\d+", version or "")[:4])
+
+
+async def _chrome_plugin_listed(headers: dict) -> bool | None:
+    """``/api/plugins`` 里是否有 id 为 ``chrome`` 的插件。
+
+    返回 ``None`` 表示问不出来（核心异常或非 200），调用方不能据此断言未安装。
+    """
+    try:
+        response = await _self_request("GET", CHROME_PLUGINS_PATH, headers=headers)
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    entries = payload if isinstance(payload, list) else payload.get("plugins", [])
+    if not isinstance(entries, list):
+        return None
+    return any(
+        isinstance(item, dict) and str(item.get("id", "")).strip() == CHROME_PLUGIN_ID
+        for item in entries
+    )
+
+
+async def _chrome_install_url(headers: dict) -> str:
+    """从插件目录取 chrome 的安装地址，取不到返回空串。
+
+    目录里可能同时有多个版本（实测 0.1.0 与 0.1.1），取版本号最大的那条；
+    不编造地址，也不回落到 GitHub 或官网链接。
+    """
+    try:
+        response = await _self_request("GET", CHROME_CATALOG_PATH, headers=headers)
+    except httpx.HTTPError:
+        return ""
+    if response.status_code != 200:
+        return ""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    entries = payload.get("plugins", []) if isinstance(payload, dict) else []
+    if not isinstance(entries, list):
+        return ""
+    candidates = [
+        item
+        for item in entries
+        if isinstance(item, dict)
+        and str(item.get("plugin_id", "")).strip() == CHROME_PLUGIN_ID
+    ]
+    if not candidates:
+        return ""
+    newest = max(
+        candidates,
+        key=lambda item: _version_key(str(item.get("version", ""))),
+    )
+    return str(newest.get("install_url", "")).strip()
+
+
+#: 插件路由「不存在」的状态码。核心对未匹配的路径按方法区分：GET 回 404，
+#: 其余方法回 405（实测 2.3.0.post1：``POST /api/nope-nope`` 是 405）。两者都
+#: 说明目标路由没挂上，只凭 404 判断会把「插件未安装」误报成「转发失败」。
+_ROUTE_MISSING_STATUS = (404, 405)
+
+
+def _unavailable(detail: str = "") -> HTTPException:
+    return HTTPException(
+        502,
+        detail={
+            "code": "bridge_endpoint_unavailable",
+            "message": detail or "无法连接核心的 Chrome 插件路由",
+        },
+    )
+
+
+async def _forward_chrome_setup(headers: dict) -> dict:
+    """把 ``setup`` 转发给 chrome 插件，返回客户端可见的结果。
+
+    路由缺失与「路径不存在」在核心里是同一种返回（见 ``_ROUTE_MISSING_STATUS``），
+    只能再用 ``/api/plugins`` 确认插件是否安装。插件在列表里但路由仍缺失，说明
+    是前缀或方法变了，回 ``bridge_endpoint_unavailable``。
+    """
+    response = None
+    for path in CHROME_SETUP_PATHS:
+        try:
+            response = await _self_request(
+                "POST",
+                path,
+                headers=headers,
+                json_body=dict(CHROME_SETUP_BODY),
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "browser repair: forward to %s failed (%s)",
+                path,
+                type(exc).__name__,
+            )
+            raise _unavailable() from exc
+        if response.status_code not in _ROUTE_MISSING_STATUS:
+            break
+
+    if response is None:
+        # 候选列表为空属于编码错误，按端点不可用处理，不把空指针带出去。
+        raise _unavailable()
+    if response.status_code in _ROUTE_MISSING_STATUS:
+        listed = await _chrome_plugin_listed(headers)
+        if listed:
+            raise _unavailable("Chrome 插件已安装，但 /setup 路由不存在")
+        install_url = "" if listed is None else await _chrome_install_url(headers)
+        raise HTTPException(
+            409,
+            detail={
+                "code": "chrome_plugin_missing",
+                "message": "服务端未安装官方 Chrome 插件，安装后才能执行修复",
+                "install_url": install_url,
+            },
+        )
+    if response.status_code >= 300:
+        logger.warning(
+            "browser repair: chrome setup returned %s",
+            response.status_code,
+        )
+        raise _unavailable(f"Chrome 插件返回 HTTP {response.status_code}")
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = response.text[:2000]
+    return {"ok": True, "action": "setup", "result": result}
+
+
+def _browser_router() -> APIRouter:
+    """浏览器控制链路的两条端点。
+
+    只补核心没有的能力：状态与自测走核心的 ``/api/browser/chrome/*``，
+    这里不重复代转；安装与修复的正主是官方 chrome 插件。
+    """
+    router = APIRouter(prefix="/browser")
+
+    @router.get("/logs")
+    async def browser_logs(
+        request: Request,
+        lines: int = Query(
+            BROWSER_LOG_DEFAULT_LINES,
+            ge=1,
+            le=BROWSER_LOG_MAX_LINES,
+            description="返回尾部多少行",
+        ),
+    ):
+        """读 NM host 日志尾部，按行脱敏。
+
+        文件不存在时回 404 ``log_not_found``：这是「扩展/宿主还没跑过」的正常
+        状态，不是插件故障。``truncated`` 表示文件比返回的内容更长。
+        """
+        _require_browser_access(request)
+        logger.info("browser logs read requested lines=%s", lines)
+        try:
+            payload = _read_nm_host_log(lines)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                404,
+                detail={
+                    "code": "log_not_found",
+                    "message": "未找到 NM host 日志",
+                },
+            ) from exc
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @router.post("/repair")
+    async def browser_repair(request: Request, body: dict):
+        """只接受白名单动作 ``setup``，转发给官方 chrome 插件。
+
+        不把客户端给的路径或参数透传到核心；转发体固定为 ``install_mode=unpacked``
+        且 ``reset=false``，重复调用是幂等的。
+        """
+        _require_browser_access(request)
+        action = str((body or {}).get("action", "")).strip()
+        if action not in BROWSER_REPAIR_ACTIONS:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "unsupported_action",
+                    "message": "仅支持 action=setup",
+                },
+            )
+        logger.info("browser repair action=%s", action)
+        result = await _forward_chrome_setup(_self_headers(request))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    return router
+
+
+# ---------------------------------------------------------------------------
+# 更新检查：GitHub latest release、每日定时与 Console「关于」块
+# ---------------------------------------------------------------------------
+
+#: 检查时间的默认值，也是 ``check_time`` 缺项或写坏时的回退值。
+UPDATE_DEFAULT_CHECK_TIME = "09:00"
+
+#: 定时任务的轮询间隔。判断精确到分钟，60 秒足够，也便于「过了检查点才启动」
+#: 的补查在一个周期内发生。
+UPDATE_POLL_SECONDS = 60.0
+
+#: 只查这个仓库的 latest release。换成 ``/releases`` 列表会让 draft/prerelease
+#: 也要自己过滤，latest 端点已经排除了 draft。
+UPDATE_RELEASE_URL = (
+    "https://api.github.com/repos/csdeTR/QwenPaw-Node-Bridge/releases/latest"
+)
+
+#: 「关于」块与取不到 ``html_url`` 时用的仓库地址。
+UPDATE_REPO_URL = "https://github.com/csdeTR/QwenPaw-Node-Bridge"
+
+#: 设置与最近一次检查结果分开存：前者由用户维护，后者由定时任务写。
+UPDATE_SETTINGS_FILE = "update_settings.json"
+UPDATE_STATE_FILE = "update_state.json"
+
+#: ``HH:MM``，24 小时制。允许 ``09:00``，不接受 ``9:0`` 与 ``24:00``。
+_UPDATE_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+#: 定时任务句柄。热重载会重新执行本模块，旧模块的句柄随之丢失，因此取消旧任务
+#: 依赖 shutdown hook（卸载插件时一定会跑），而不是这个变量。
+_update_task: asyncio.Task | None = None
+
+
+def _update_settings_path() -> Path:
+    return _data_dir() / UPDATE_SETTINGS_FILE
+
+
+def _update_state_path() -> Path:
+    return _data_dir() / UPDATE_STATE_FILE
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """与 ``_save_ssh_settings`` 同一套原子写：临时文件 + 0600 + rename。"""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _default_update_settings() -> dict:
+    return {
+        "enabled": True,
+        "check_time": UPDATE_DEFAULT_CHECK_TIME,
+        "notify_console": True,
+        "notify_client": True,
+    }
+
+
+def _parse_check_time(text: object) -> tuple[int, int] | None:
+    """``HH:MM`` 解析成 ``(时, 分)``。定时判断与界面共用这一套规则。"""
+    match = _UPDATE_TIME_RE.match(str(text or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _load_update_settings() -> dict:
+    """读设置，缺项与坏值一律按默认值补齐，不抛异常。
+
+    文件可能被手工改坏或来自旧版本；更新检查坏了不该让设置页打不开。
+    """
+    defaults = _default_update_settings()
+    try:
+        data = json.loads(_update_settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    settings = dict(defaults)
+    for name in ("enabled", "notify_console", "notify_client"):
+        if isinstance(data.get(name), bool):
+            settings[name] = data[name]
+    if _parse_check_time(data.get("check_time")) is not None:
+        settings["check_time"] = str(data["check_time"]).strip()
+    return settings
+
+
+def _bool_field(body: dict, name: str, current: bool) -> bool:
+    """只接受真布尔值：``"false"`` 是真值字符串，按 ``bool()`` 会变成开启。"""
+    if name not in body:
+        return current
+    value = body[name]
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} 必须是布尔值")
+    return value
+
+
+def _validate_update_settings(body: dict, current: dict) -> dict:
+    """校验并合并设置。只写这四个字段，未知字段忽略。"""
+    settings = {
+        "enabled": _bool_field(body, "enabled", current["enabled"]),
+        "check_time": current["check_time"],
+        "notify_console": _bool_field(
+            body,
+            "notify_console",
+            current["notify_console"],
+        ),
+        "notify_client": _bool_field(
+            body,
+            "notify_client",
+            current["notify_client"],
+        ),
+    }
+    if "check_time" in body:
+        text = str(body.get("check_time") or "").strip()
+        if not text:
+            raise ValueError("检查时间不能为空")
+        if _parse_check_time(text) is None:
+            raise ValueError("检查时间必须是 HH:MM 格式，例如 09:00")
+        settings["check_time"] = text
+    return settings
+
+
+def _load_update_state() -> dict:
+    try:
+        data = json.loads(_update_state_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _local_date_key(moment: datetime | None = None) -> str:
+    """本地日期键。用户填的 HH:MM 是墙上时间，判断必须用同一时区。"""
+    return (moment or datetime.now()).strftime("%Y-%m-%d")
+
+
+def _update_due(now: datetime, check_time: str, last_check_date: str) -> bool:
+    """今天该不该跑一次检查。纯函数，单测直接调。
+
+    两条规则合并成一个判断：到了检查点、且今天没查过。服务在检查点之后启动时，
+    第一次轮询就满足「已过检查点」，于是立即补查，不需要单独的启动分支。
+    """
+    if str(last_check_date or "") == _local_date_key(now):
+        return False
+    parsed = _parse_check_time(check_time) or _parse_check_time(
+        UPDATE_DEFAULT_CHECK_TIME,
+    )
+    return (now.hour, now.minute) >= parsed
+
+
+def _release_version(payload: dict) -> str:
+    """从 release 里取版本号。``tag_name`` 可能带 ``v`` 前缀。"""
+    tag = str(payload.get("tag_name", "") or "").strip()
+    return tag[1:].strip() if tag.startswith("v") else tag
+
+
+async def _github_get(url: str, headers: dict, *, trust_env: bool) -> httpx.Response:
+    """发一次 GitHub 请求。``trust_env`` 决定是否读环境里的代理设置。"""
+    async with httpx.AsyncClient(
+        timeout=10.0,
+        follow_redirects=True,
+        trust_env=trust_env,
+    ) as client:
+        return await client.get(url, headers=headers)
+
+
+async def _fetch_latest_release(plugin_version: str) -> dict:
+    """查 GitHub 的 latest release，返回原始对象。
+
+    独立 client、``trust_env=True``：服务器上常见 ``HTTPS_PROXY`` 才能出网；
+    与自请求的 ``trust_env=False`` 相反，那个是为了避免回环请求绕到代理。
+
+    代理配置本身解析失败时直连重试一次。实测 httpx 0.28 在 ``no_proxy`` 含
+    ``[::1]`` 时把方括号当成端口，抛 ``InvalidURL: Invalid port: ':1]'``；
+    此时请求还没发出去，重试不会重复提交。网络本身不通时直连也会失败，
+    与不重试的结果相同。
+    """
+    headers = {
+        "User-Agent": f"qwenpaw-node-bridge/{plugin_version or 'unknown'}",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        response = await _github_get(UPDATE_RELEASE_URL, headers, trust_env=True)
+    except httpx.InvalidURL:
+        logger.warning("[update] proxy environment unusable; retrying without it")
+        response = await _github_get(UPDATE_RELEASE_URL, headers, trust_env=False)
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub 返回 HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError("GitHub 返回内容不是 JSON") from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub 返回内容不是对象")
+    return payload
+
+
+async def _check_for_update(plugin_version: str) -> dict:
+    """执行一次检查并落盘。
+
+    **失败只记 ``error``，保留上次成功结论**：网络抖动不该把「有新版本」抹成
+    「已是最新」。``checked_at`` 与 ``last_check_date`` 无论如何都推进，避免
+    失败后每分钟重试把 GitHub 打到限流。
+    """
+    state = _load_update_state()
+    now = int(time.time())
+    try:
+        payload = await _fetch_latest_release(plugin_version)
+        latest = _release_version(payload)
+        if not latest:
+            raise RuntimeError("GitHub 未返回版本号")
+        if payload.get("draft") or payload.get("prerelease"):
+            state.update(
+                {
+                    "update_available": False,
+                    "latest_version": latest,
+                    "latest_url": str(payload.get("html_url", "") or ""),
+                    "error": "",
+                },
+            )
+            logger.info("[update] latest release skipped (draft/prerelease) tag=%s", latest)
+        else:
+            available = _version_key(latest) > _version_key(plugin_version)
+            state.update(
+                {
+                    "update_available": available,
+                    "latest_version": latest,
+                    "latest_url": str(
+                        payload.get("html_url", "") or UPDATE_REPO_URL,
+                    ),
+                    "error": "",
+                },
+            )
+            logger.info(
+                "[update] check ok current=%s latest=%s update_available=%s",
+                plugin_version,
+                latest,
+                available,
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        state["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        logger.warning("[update] check failed error=%s", state["error"])
+    state["checked_at"] = now
+    state["last_check_date"] = _local_date_key()
+    _atomic_write_json(_update_state_path(), state)
+    return state
+
+
+def _update_status(plugin_version: str) -> dict:
+    """设置与最近一次检查结果的合并视图。``error`` 为空表示最近一次成功。"""
+    settings = _load_update_settings()
+    state = _load_update_state()
+    return {
+        "enabled": settings["enabled"],
+        "check_time": settings["check_time"],
+        "notify_console": settings["notify_console"],
+        "notify_client": settings["notify_client"],
+        "update_available": bool(state.get("update_available", False)),
+        "latest_version": str(state.get("latest_version", "") or ""),
+        "latest_url": str(state.get("latest_url", "") or ""),
+        "checked_at": int(state.get("checked_at", 0) or 0),
+        "last_check_date": str(state.get("last_check_date", "") or ""),
+        "error": str(state.get("error", "") or ""),
+        "plugin_version": plugin_version,
+        "protocol_version": PROTOCOL_VERSION,
+        "server_version": _server_version(),
+        "repo_url": UPDATE_REPO_URL,
+    }
+
+
+async def _update_loop(plugin_version: str) -> None:
+    """每 60 秒判断一次；单次失败不退出循环。"""
+    logger.info(
+        "[update] scheduler started check_time=%s",
+        _load_update_settings()["check_time"],
+    )
+    try:
+        while True:
+            try:
+                settings = _load_update_settings()
+                if settings["enabled"] and _update_due(
+                    datetime.now(),
+                    settings["check_time"],
+                    str(_load_update_state().get("last_check_date", "")),
+                ):
+                    await _check_for_update(plugin_version)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("[update] scheduler tick failed")
+            await asyncio.sleep(UPDATE_POLL_SECONDS)
+    except asyncio.CancelledError:
+        logger.info("[update] scheduler stopped")
+        raise
+
+
+def _start_update_loop(plugin_version: str) -> None:
+    """启动定时任务。同一模块内重复调用时先取消旧任务。"""
+    global _update_task  # pylint: disable=global-statement
+    if _update_task is not None and not _update_task.done():
+        _update_task.cancel()
+    _update_task = asyncio.create_task(_update_loop(plugin_version))
+
+
+async def _stop_update_loop() -> None:
+    """取消定时任务并等它退出。热重载与停服都会走到这里。"""
+    global _update_task  # pylint: disable=global-statement
+    task = _update_task
+    _update_task = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("[update] scheduler exit failed")
+
+
+def _require_update_access(request: Request) -> None:
+    """更新端点的访问校验，策略与 SSH、浏览器、配对相同。"""
+    client_host = request.client.host if request.client else None
+    if not _ssh_access_allowed(
+        token=_http_token(request),
+        client_host=client_host,
+        headers=request.headers,
+    ):
+        raise HTTPException(401, "Update endpoints require authentication")
+
+
+def _update_router(plugin_version: str) -> APIRouter:
+    """更新检查的四条端点。
+
+    ``GET /update/status`` 给「关于」块与客户端读取；``GET/PUT /update/settings``
+    只碰设置；``POST /update/check`` 立即检查，失败回 502 且状态文件里同时留下
+    ``error``，界面据此区分「检查失败」与「没有新版本」。
+    """
+    router = APIRouter(prefix="/update")
+
+    @router.get("/status")
+    async def update_status(request: Request):
+        _require_update_access(request)
+        return JSONResponse(
+            _update_status(plugin_version),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @router.get("/settings")
+    async def get_update_settings(request: Request):
+        _require_update_access(request)
+        return JSONResponse(
+            _load_update_settings(),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @router.put("/settings")
+    async def put_update_settings(request: Request, body: dict):
+        _require_update_access(request)
+        try:
+            settings = _validate_update_settings(body, _load_update_settings())
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        _atomic_write_json(_update_settings_path(), settings)
+        logger.info(
+            "[update] settings updated enabled=%s check_time=%s"
+            " notify_console=%s notify_client=%s",
+            settings["enabled"],
+            settings["check_time"],
+            settings["notify_console"],
+            settings["notify_client"],
+        )
+        return JSONResponse(settings, headers={"Cache-Control": "no-store"})
+
+    @router.post("/check")
+    async def check_update_now(request: Request):
+        _require_update_access(request)
+        logger.info("[update] manual check requested")
+        state = await _check_for_update(plugin_version)
+        if state.get("error"):
+            raise HTTPException(
+                502,
+                detail={
+                    "code": "update_check_failed",
+                    "message": str(state["error"]),
+                },
+            )
+        return JSONResponse(
+            _update_status(plugin_version),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return router
+
+
 class BridgePlugin:
     """插件主体。"""
 
     def register(self, api) -> None:
+        _ensure_file_logging()
         router = APIRouter()
 
         @router.get("/info")
@@ -1222,6 +2127,22 @@ class BridgePlugin:
                 "protocol_version": PROTOCOL_VERSION,
                 "server_version": _server_version(),
                 "capabilities": list(CAPABILITIES),
+            }
+
+        @router.get("/logs")
+        async def plugin_logs(
+            request: Request,
+            lines: int = Query(200, ge=1, le=1000, description="返回尾部多少行"),
+        ):
+            """插件自己的日志（设置变更、SSH 连接、修复动作）。
+
+            行内容按浏览器日志同一套规则脱敏；只读接口，不写入日志文件。
+            """
+            _require_logs_access(request)
+            raw, truncated = _tail_plugin_log(lines)
+            return {
+                "lines": [_sanitize_log_line(line) for line in raw],
+                "truncated": truncated,
             }
 
         @router.get("/search")
@@ -1506,6 +2427,12 @@ class BridgePlugin:
                 "revoked": False,
             }
             _save_pairing(data)
+            logger.info(
+                "pairing token issued jti=%s user=%s label=%s",
+                jti,
+                username,
+                spec["label"],
+            )
             payload = _pair_payload(spec["addresses"], token)
             try:
                 image = _pair_qrcode_image(payload)
@@ -1563,6 +2490,7 @@ class BridgePlugin:
             applied = _core_revoke_jti(jti, int(item.get("expires_at", 0) or 0))
             item["revoked"] = True
             _save_pairing(data)
+            logger.info("pairing token revoked jti=%s immediate=%s", jti, applied)
             return JSONResponse(
                 {"revoked": True, "immediate": applied},
                 headers={"Cache-Control": "no-store"},
@@ -1599,6 +2527,10 @@ class BridgePlugin:
             )
 
         router.include_router(_portability_router())
+        router.include_router(_browser_router())
+        # 版本读 manifest，与 /info 的 plugin_version 同源。
+        plugin_version = str(api.manifest.get("version", ""))
+        router.include_router(_update_router(plugin_version))
         api.register_http_router(router, prefix=ROUTE_PREFIX)
         api.register_channel(
             channel_class=NodeBridgePushChannel,
@@ -1649,6 +2581,26 @@ class BridgePlugin:
                 },
             ],
         )
+        # 更新检查的定时任务挂在插件生命周期上。热重载会重新执行本模块：
+        # 卸载时 registry 先跑一次 shutdown hook 取消旧任务，新模块再起新任务，
+        # 因此不会出现两个循环同时写状态文件。
+        register_startup = getattr(api, "register_startup_hook", None)
+        register_shutdown = getattr(api, "register_shutdown_hook", None)
+        if register_startup and register_shutdown:
+            register_startup(
+                hook_name="qwenpaw_node_bridge_update",
+                callback=lambda: _start_update_loop(plugin_version),
+                priority=60,
+            )
+            register_shutdown(
+                hook_name="qwenpaw_node_bridge_update",
+                callback=_stop_update_loop,
+                priority=60,
+            )
+        else:
+            logger.warning(
+                "[update] server has no lifecycle hooks; scheduled checks disabled",
+            )
         logger.info(
             "qwenpaw-node-bridge registered at %s (protocol=%s)",
             ROUTE_PREFIX,

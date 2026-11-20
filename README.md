@@ -18,6 +18,7 @@
 | v0.4.1 | 认证策略调整（未开 Web 认证时按私有/受信任来源放行）、Console 路由改名、修双 `/api` 前缀 404；无新端点 | 同上 |
 | v0.4.2 | 设置页分块与菜单图标；无新端点 | 同上 |
 | v0.4.3 | `POST/GET /pairing/tokens`、`POST /pairing/tokens/{jti}/revoke`、`PATCH/DELETE /pairing/tokens/{jti}`，控制台「设备配对」面板 | `pairing` |
+| v0.5.0 | `GET /browser/logs`、`POST /browser/repair`、`GET /logs`；`GET /update/status`、`GET/PUT /update/settings`、`POST /update/check`（随客户端 0.7.3 完成） | `browser`、`update` |
 
 **客户端只按 `capabilities` 里的名字开关功能，不比对版本号**，`plugin_version`只用于展示与排查。字段改名不改变 `capabilities`，但会破坏旧客户端的解析，发版说明必须写明。
 
@@ -58,9 +59,9 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 ```
 
 ```json
-{"plugin_version":"0.4.2","protocol_version":1,
+{"plugin_version":"0.5.0","protocol_version":1,
  "server_version":"2.2.2.post1",
- "capabilities":["info","search","sse","portability","push","ssh"]}
+ "capabilities":["info","search","sse","portability","push","ssh","pairing","browser","update"]}
 ```
 
 三点判据：未安装时该路径返回 404；返回 401 只说明服务端开了登录而请求没带 token，**不能**据此判断插件不存在；插件加载需要数秒，安装后立刻请求可能仍是 404，等十秒再试。
@@ -87,6 +88,119 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 连接后先发 `ready`，随后各发一次 `inbox` 与 `approval` 的当前值，此后只在数值变化时推送；插件每 2.5 秒在连接内部轮询，客户端断开即退出生成器。
 
 **不包含定时任务。** `CronManager` 按 workspace 隔离，取摘要需要请求上下文里的智能体标识，而事件生成器里没有 `Request`，客户端的定时任务仍走轮询。
+
+## v0.5.0：浏览器控制链路的日志与修复
+
+浏览器控制链路的状态与自检仍由核心提供：`GET /api/browser/chrome/status`、
+`POST /api/browser/chrome/self-test`。**Bridge 不代转、不缓存这两项**，本版本只补核心
+没有的两件事：读 NM host 日志、把修复动作转发给官方 Chrome 插件。
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/browser/logs?lines=200` | 读取 NM host 日志尾部，按行脱敏；`lines` 取值 1–2000，默认 200 |
+| POST | `/browser/repair` | 只接受 `{"action":"setup"}`，转发官方 Chrome 插件的 `setup` |
+
+访问策略与 SSH、设备配对一致：开了 Web 登录时只认有效 token；未开时只放行私有/回环
+来源，或带 `X-QwenPaw-Trusted-Host: 1` 的请求。修复会驱动服务端安装扩展资产与 NM host，
+属于写操作，客户端应保留二次确认。
+
+### 日志端点
+
+返回 `{"lines": [...], "truncated": bool, "path": "..."}`。
+
+- 读取 `WORKING_DIR/logs/nm-host.log`，默认即 `~/.qwenpaw/logs/nm-host.log`；服务端用
+  `QWENPAW_WORKING_DIR` 或历史目录 `~/.copaw` 时随之变化。
+- 只从文件尾部读取最多 512 KB、最多 2000 行；`truncated` 表示文件比返回的内容更长。
+  从中间开始时首个半行会被丢弃。
+- 文件不存在时回 404，`detail` 为 `{"code":"log_not_found","message":"..."}`。这表示
+  扩展或宿主尚未启动过，不是插件故障。
+- 按行脱敏后返回，替换为 `***` 的八类内容：`Authorization:`、`Bearer …`、`Cookie:`、
+  `Set-Cookie:`、`token=`、`api_key=`、`X-Api-Key:`、`secret=`；JSON 形式的同名键也覆盖。
+  插件自身不打印 token、密钥或完整请求头。
+
+### 插件自身日志
+
+`GET /logs?lines=200` 读取 `WORKING_DIR/plugin_data/qwenpaw-node-bridge/plugin.log`，
+默认即 `~/.qwenpaw/plugin_data/qwenpaw-node-bridge/plugin.log`。记录设置变更、SSH 中继
+连接与断开、设备配对令牌签发/吊销、浏览器日志读取与修复动作；按行使用同一套脱敏规则。
+文件按 512 KB × 3 轮转。Web 控制台的「QwenPaw Node Bridge」设置页有「插件日志」块，
+可刷新查看最近 300 行。
+
+### 修复端点
+
+转发目标为 `http://127.0.0.1:<端口>/api/chrome/setup`，回退 `/api/plugins/chrome/setup`
+（插件把路由前缀写成 `/plugins/chrome` 时的实际路径），请求体固定为
+`{"install_mode":"unpacked","reset":false}`。
+
+- **端口取值**：优先用核心进程内的 `read_last_api()`（CLI 与桌面壳启动时都会写入），
+  其次读环境变量 `QWENPAW_API_PORT`、`QWENPAW_PORT`，最后回落到 8088。主机固定
+  `127.0.0.1`，不经过网卡，也不受服务绑定地址影响。
+- **鉴权**：插件先自行校验调用方 token（与 SSH、配对同一套 `verify_token` 流程），再把
+  同一个 `Authorization: Bearer` 转发给 Chrome 插件的路由，不另发内部凭据。未开 Web
+  登录时改发受信任标记。
+- **失败返回**：
+
+| 状态 | `detail.code` | 含义 |
+| --- | --- | --- |
+| 409 | `chrome_plugin_missing` | 服务端未安装 `chrome` 插件；`install_url` 取自 `/api/plugins/catalog` 中版本号最大的条目，取不到为空串 |
+| 502 | `bridge_endpoint_unavailable` | 转发失败、插件路由不存在，或插件返回其它非 2xx |
+| 400 | `unsupported_action` | 动作不在白名单内 |
+
+- 插件在 `/api/plugins` 列表里存在、但 `/setup` 仍回 404 或 405 时，按路由不可用处理
+  （502），不误报成「未安装」。核心对未匹配的路径按请求方法区分：GET 回 404，
+  POST 回 405（实测 2.3.0.post1），所以「插件未安装」不能只看 404。
+- 重复调用是幂等的：`reset` 固定为 `false`，不会清空已有配置。
+- 成功时回 200，形状为 `{"ok": true, "action": "setup", "result": <插件返回原文>}`。
+
+### 更新检查与关于
+
+插件每天在固定时间查一次 GitHub 的 latest release，结果供 Console 的「关于」块与
+客户端提示使用。能力名 `update`，端点如下。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/update/status` | 设置与最近一次检查结果的合并视图 |
+| GET | `/update/settings` | 只读四个设置字段 |
+| PUT | `/update/settings` | 修改设置；`check_time` 必须是 `HH:MM`，布尔字段只接受真布尔值 |
+| POST | `/update/check` | 立即检查；失败回 502，`detail.code` 为 `update_check_failed` |
+
+`GET /update/status` 返回 `enabled`、`check_time`、`notify_console`、`notify_client`、
+`update_available`、`latest_version`、`latest_url`、`checked_at`、`last_check_date`、
+`error`、`plugin_version`、`protocol_version`、`server_version`，另附 `repo_url` 供
+界面显示仓库链接。访问策略与 SSH、浏览器、配对一致：开了 Web 登录时只认有效 token；
+未开时只放行私有/回环来源，或带 `X-QwenPaw-Trusted-Host: 1` 的请求。
+
+- **默认值**：`enabled=true`、`check_time=09:00`、`notify_console=true`、
+  `notify_client=true`。设置写在 `~/.qwenpaw/plugin_data/qwenpaw-node-bridge/update_settings.json`，
+  目录 `0700`、文件 `0600`，与 SSH 设置同一套原子写。
+- **定时判断**：服务端每 60 秒判断一次「已到 `check_time` 且当天未检查」。两条行为由此
+  自动成立：到点当天查一次；服务在 `check_time` 之后启动时，第一次轮询就补查。
+  任务随插件生命周期启停，热重载时卸载流程先取消旧任务再起新任务，不会出现两个循环
+  同时写状态。
+- **请求**：`User-Agent: qwenpaw-node-bridge/<版本>`、`Accept: application/vnd.github+json`，
+  超时 10 秒、跟随重定向、读环境变量里的代理。代理配置本身解析失败时直连重试一次
+  （实测 httpx 0.28 在 `no_proxy` 含 `[::1]` 时抛 `InvalidURL: Invalid port: ':1]'`，
+  此时请求尚未发出）。`draft` 与 `prerelease` 不算新版本。版本比较按数字段，
+  `0.10.0` 高于 `0.9.9`。
+- **失败处理**：`error` 记录最近一次失败，`update_available`、`latest_version`、
+  `latest_url` 保留上一次成功的结论——网络抖动不该把「有新版本」抹成「已是最新」。
+  `checked_at` 与 `last_check_date` 无论成败都推进，避免失败后每分钟重试。
+- **Console**：设置页末尾的「关于」块显示插件版本、协议版本、服务端版本、仓库链接、
+  最近检查时间与结果，提供自动检查、每日时间、Console 提示、QP Node 提示四项设置，
+  以及「检查更新」按钮。页面加载时若有新版本且开了 Console 提示，弹一次轻提示
+  （模块级标记，切块或重复加载不会重复弹）。
+- **日志筛选**：「插件日志」块可按时间段（1 小时 / 24 小时 / 7 天 / 全部）、功能点
+  （设置 / SSH / 配对 / 浏览器 / 更新 / 推送 / 其他）与关键词筛选，并显示「筛选后 / 总行数」。
+  分类取自行内关键字，无时间戳的续行沿用上一行的时间与分类。筛选全在前端完成，
+  切换条件不重新请求；日志框用透明背景与中性描边，深色模式下同样可读。
+
+### 测试
+
+```bash
+~/.qwenpaw/venv/bin/python -m unittest discover -s backend/tests -v
+```
 
 ## v0.4.3：设备配对
 
