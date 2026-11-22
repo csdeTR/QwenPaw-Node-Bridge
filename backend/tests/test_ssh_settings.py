@@ -169,29 +169,46 @@ class SshSettingsTest(unittest.TestCase):
                 main._require_ssh_access(request)
         self.assertEqual(ctx.exception.status_code, 401)
 
-    def test_http_auth_off_allows_trusted_header(self):
+    def test_http_auth_off_ignores_trusted_header(self):
         request = self._http_request(
             headers={"x-qwenpaw-trusted-host": "1"},
             client=("8.8.8.8", 50000),
         )
         with mock.patch.object(main, "_ssh_auth_enabled", return_value=False):
-            main._require_ssh_access(request)
+            with self.assertRaises(HTTPException) as ctx:
+                main._require_ssh_access(request)
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertEqual(ctx.exception.detail["code"], "trusted_address_required")
+
+    def test_http_auth_off_allows_bridge_trusted_address(self):
+        request = self._http_request(
+            headers={"host": "chat.example.com"},
+            client=("8.8.8.8", 50000),
+        )
+        with mock.patch.object(main, "_ssh_auth_enabled", return_value=False):
+            with mock.patch.object(
+                main,
+                "_load_trusted_addresses",
+                return_value=[
+                    {"host": "chat.example.com", "source_cidr": "8.8.8.0/24"},
+                ],
+            ):
+                main._require_ssh_access(request)
 
     def test_access_helper_shares_policy_with_ws(self):
-        headers = {"x-qwenpaw-trusted-host": "1"}
         with mock.patch.object(main, "_ssh_auth_enabled", return_value=False):
             self.assertTrue(
                 main._ssh_access_allowed(
                     token=None,
-                    client_host="8.8.8.8",
-                    headers=headers,
+                    client_host="10.0.0.5",
+                    headers={},
                 ),
             )
             self.assertFalse(
                 main._ssh_access_allowed(
                     token=None,
                     client_host="8.8.8.8",
-                    headers={},
+                    headers={"x-qwenpaw-trusted-host": "1"},
                 ),
             )
 

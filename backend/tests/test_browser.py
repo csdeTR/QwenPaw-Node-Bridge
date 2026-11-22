@@ -197,7 +197,7 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(headers["authorization"], "Bearer pair-token")
         self.assertEqual(body, {"install_mode": "unpacked", "reset": False})
 
-    def test_repair_forwards_trusted_header_without_token(self):
+    def test_repair_does_not_forward_trusted_header(self):
         calls = []
 
         async def fake_request(method, path, *, headers=None, json_body=None):
@@ -205,12 +205,13 @@ class BrowserTest(unittest.TestCase):
             return httpx.Response(200, json={})
 
         with mock.patch.object(main, "_self_request", new=fake_request):
-            _client().post(
+            response = _client().post(
                 f"{PREFIX}/browser/repair",
                 json={"action": "setup"},
                 headers={"x-qwenpaw-trusted-host": "1"},
             )
-        self.assertEqual(calls[0][2].get("x-qwenpaw-trusted-host"), "1")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("x-qwenpaw-trusted-host", calls[0][2])
 
     # ---- 修复：插件未装 / 路由缺失 / 转发失败 ----
 
@@ -401,7 +402,7 @@ class BrowserTest(unittest.TestCase):
         manifest = json.loads(
             (ROOT_DIR / "plugin.json").read_text(encoding="utf-8"),
         )
-        self.assertEqual(manifest["version"], "0.5.0")
+        self.assertEqual(manifest["version"], "0.5.1")
         self.assertIn("browser", manifest["meta"]["capabilities"])
         self.assertEqual(
             tuple(manifest["meta"]["capabilities"]),

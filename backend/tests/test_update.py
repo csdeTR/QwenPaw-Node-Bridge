@@ -25,7 +25,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 import main  # noqa: E402  pylint: disable=wrong-import-position
 
 PREFIX = "/api/plugins/qwenpaw-node-bridge"
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.5.1"
 
 
 class _FakeResponse:
@@ -278,7 +278,7 @@ class VersionCompareTest(unittest.TestCase):
 
     def test_equal_version_is_not_an_update(self):
         self.assertFalse(
-            main._version_key("0.5.0") > main._version_key(PLUGIN_VERSION),
+            main._version_key("0.5.1") > main._version_key(PLUGIN_VERSION),
         )
 
 
@@ -348,11 +348,11 @@ class UpdateCheckTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_version_is_not_an_update(self):
         self._patch_github(
-            response=_FakeResponse(200, {"tag_name": "v0.5.0"}),
+            response=_FakeResponse(200, {"tag_name": "v0.5.1"}),
         )
         state = await main._check_for_update(PLUGIN_VERSION)
         self.assertFalse(state["update_available"])
-        self.assertEqual(state["latest_version"], "0.5.0")
+        self.assertEqual(state["latest_version"], "0.5.1")
         self.assertEqual(state["error"], "")
 
     async def test_failure_keeps_last_success(self):
@@ -579,7 +579,7 @@ class UpdateManifestTest(unittest.TestCase):
         manifest = json.loads(
             (ROOT_DIR / "plugin.json").read_text(encoding="utf-8"),
         )
-        self.assertEqual(manifest["version"], "0.5.0")
+        self.assertEqual(manifest["version"], "0.5.1")
         self.assertIn("update", manifest["meta"]["capabilities"])
         self.assertEqual(
             tuple(manifest["meta"]["capabilities"]),

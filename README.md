@@ -19,6 +19,7 @@
 | v0.4.2 | 设置页分块与菜单图标；无新端点 | 同上 |
 | v0.4.3 | `POST/GET /pairing/tokens`、`POST /pairing/tokens/{jti}/revoke`、`PATCH/DELETE /pairing/tokens/{jti}`，控制台「设备配对」面板 | `pairing` |
 | v0.5.0 | `GET /browser/logs`、`POST /browser/repair`、`GET /logs`；`GET /update/status`、`GET/PUT /update/settings`、`POST /update/check`（随客户端 0.7.3 完成） | `browser`、`update` |
+| v0.5.1 | `GET/PUT /trusted-addresses`；`GET /ssh/settings` 与 `GET /ssh/config` 加访问校验；移除受信头；无新增 capability | 同上 |
 
 **客户端只按 `capabilities` 里的名字开关功能，不比对版本号**，`plugin_version`只用于展示与排查。字段改名不改变 `capabilities`，但会破坏旧客户端的解析，发版说明必须写明。
 
@@ -46,11 +47,15 @@ https://github.com/csdeTR/QwenPaw-Node-Bridge/releases/latest/download/qwenpaw-n
 从源码打包时，在仓库根目录执行（`plugin validate` 接受目录，不是 zip）：
 
 ```bash
-zip -r -X qwenpaw-node-bridge.zip plugin.json backend ui \
+zip -r -X qwenpaw-node-bridge.zip plugin.json backend ui README.md \
   -x 'backend/__pycache__/*' 'backend/tests/*'
+sha256sum qwenpaw-node-bridge.zip > SHA256SUMS
 ~/.qwenpaw/venv/bin/qwenpaw plugin validate .
-~/.qwenpaw/venv/bin/qwenpaw plugin install qwenpaw-node-bridge.zip
+~/.qwenpaw/venv/bin/qwenpaw plugin install .
 ```
+
+正式发版由 tag 触发的 `.github/workflows/release.yml` 自动打包 zip 并生成
+`SHA256SUMS`；2.3.0.post1 的 `plugin install` 只接受解压目录，不接受 zip。
 
 安装后重启服务端，请求自述端点确认：
 
@@ -59,7 +64,7 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 ```
 
 ```json
-{"plugin_version":"0.5.0","protocol_version":1,
+{"plugin_version":"0.5.1","protocol_version":1,
  "server_version":"2.2.2.post1",
  "capabilities":["info","search","sse","portability","push","ssh","pairing","browser","update"]}
 ```
@@ -89,6 +94,40 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 
 **不包含定时任务。** `CronManager` 按 workspace 隔离，取摘要需要请求上下文里的智能体标识，而事件生成器里没有 `Request`，客户端的定时任务仍走轮询。
 
+## v0.5.1：来源网段、受信任地址与国际化
+
+本版不新增 capability，只收紧访问策略并补基础设施。
+
+### 敏感端点访问策略
+
+- 开启 Web 登录认证时，所有敏感端点只认有效 token。
+- 未开启时，来源命中私有/回环/链路本地/CGNAT 100.64.0.0/10、IPv6 ULA 或
+  `QWENPAW_BRIDGE_TRUSTED_CIDRS` 的客户端直接放行。
+- 其他来源必须在 Console 的「受信任地址」中添加请求 Host，并填写来源网段；
+  只有 Host 与来源 IP 同时命中才放行。App 侧也要把同一地址加入受信任地址，
+  两侧都配置才生效。
+- 反向代理部署需要设置 `QWENPAW_BRIDGE_TRUST_PROXY=1`，且反代覆盖
+  `X-Forwarded-For` / `X-Forwarded-Host`；存在转发头但未开启时敏感端点按未认证处理。
+- 旧的 `X-QwenPaw-Trusted-Host: 1` 不再接受，App 也不再发送。
+
+### 新增端点
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/trusted-addresses` | 返回 `{"items":[{"host","source_cidr"}]}` |
+| PUT | `/trusted-addresses` | 全量替换；条目校验与去重，非法来源网段回 400 |
+
+`GET /ssh/settings` 与 `GET /ssh/config` 现在也走同一访问策略；公网未认证来源返回
+`{"code":"trusted_address_required","message":…}`，客户端据此提示去设置页配置。
+
+### 其他
+
+- **文件权限**：`ssh_settings.json`、`ssh_key`、`pairing_tokens.json`、
+  `trusted_addresses.json` 创建即 0600 并原子替换；数据目录 0700。
+- **国际化**：后端按 `?lang` → `Accept-Language` → Console 语言 → 中文解析；
+  Console 面板在渲染层统一翻译。当前只提供简体中文，旧客户端行为不变。
+- **发布**：tag 触发的 workflow 产出 `qwenpaw-node-bridge.zip` 与 `SHA256SUMS`。
+
 ## v0.5.0：浏览器控制链路的日志与修复
 
 浏览器控制链路的状态与自检仍由核心提供：`GET /api/browser/chrome/status`、
@@ -102,8 +141,8 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 | GET | `/browser/logs?lines=200` | 读取 NM host 日志尾部，按行脱敏；`lines` 取值 1–2000，默认 200 |
 | POST | `/browser/repair` | 只接受 `{"action":"setup"}`，转发官方 Chrome 插件的 `setup` |
 
-访问策略与 SSH、设备配对一致：开了 Web 登录时只认有效 token；未开时只放行私有/回环
-来源，或带 `X-QwenPaw-Trusted-Host: 1` 的请求。修复会驱动服务端安装扩展资产与 NM host，
+访问策略与 SSH、设备配对一致：开了 Web 登录时只认有效 token；未开时只放行私有/回环/CGNAT/组网
+来源，或 App 与 Bridge 两侧都命中受信任地址的来源。修复会驱动服务端安装扩展资产与 NM host，
 属于写操作，客户端应保留二次确认。
 
 ### 日志端点
@@ -170,7 +209,7 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 `update_available`、`latest_version`、`latest_url`、`checked_at`、`last_check_date`、
 `error`、`plugin_version`、`protocol_version`、`server_version`，另附 `repo_url` 供
 界面显示仓库链接。访问策略与 SSH、浏览器、配对一致：开了 Web 登录时只认有效 token；
-未开时只放行私有/回环来源，或带 `X-QwenPaw-Trusted-Host: 1` 的请求。
+未开时只放行私有/回环/CGNAT/组网来源，或 App 与 Bridge 两侧都命中受信任地址的来源。
 
 - **默认值**：`enabled=true`、`check_time=09:00`、`notify_console=true`、
   `notify_client=true`。设置写在 `~/.qwenpaw/plugin_data/qwenpaw-node-bridge/update_settings.json`，
@@ -229,7 +268,7 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 ## v0.4.1：SSH 访问策略与 Console 命名
 
 - **Bridge 中继不再要求服务端 Web 登录认证。** 本地 PTY 仍然要求；中继只要求 Console 里配置了 SSH 目标与凭据。
-- 未开 Web 认证时，`PUT /ssh/settings`、`GET /ssh/credential` 与 `WS /ssh` 只放行**私有/回环客户端**，或带 `X-QwenPaw-Trusted-Host: 1` 的请求。该标记由 App 在「受信任的连接」确认地址后、或 Console 页面勾选「此地址仅我可访问」后发送；它只是用户确认，不是密码学证明。公网部署仍应开启登录认证与 HTTPS。
+- 未开 Web 认证时，`PUT /ssh/settings`、`GET /ssh/credential` 与 `WS /ssh` 只放行**私有/回环客户端**，或带 `X-QwenPaw-Trusted-Host: 1` 的请求。该标记由 App 在「受信任的连接」确认地址后、或 Console 页面勾选「此地址仅我可访问」后发送；它只是用户确认，不是密码学证明。公网部署仍应开启登录认证与 HTTPS。（v0.5.1 起该受信头已移除，改为来源网段 + 两侧受信任地址，见上文 v0.5.1 小节。）
 - 开了 Web 认证时行为不变：敏感端点要求有效 token。
 - Console 的宿主分组「扩展设置」不变；插件路由 label 由「SSH 设置」改为 **QwenPaw Node Bridge**，页面内仍只放 SSH 设置。
 - 修复 Console 页面请求路径重复 `/api` 前缀导致的 404：`host.getApiUrl` 会自动补 `/api`，前端只传 `/plugins/qwenpaw-node-bridge/ssh/settings`。
@@ -260,7 +299,7 @@ curl -s http://127.0.0.1:8088/api/plugins/qwenpaw-node-bridge/info
 
 ### 控制台设置面板
 
-`ui/index.js` 通过 `window.QwenPaw.registerRoutes("qwenpaw-node-bridge", …)` 挂到 Settings →「扩展设置」→「QwenPaw Node Bridge」，使用宿主注入的 `React` / `antd` / `getApiUrl` / `getApiToken`。字段为地址、端口、用户名、认证方式、私钥来源、私钥路径或内容、口令、登录密码；保存后只显示「已配置 / 未配置」。未开 Web 认证时可用「此地址仅我可访问」勾选放行公网受信任地址；页面使用 HTTP 时显示明文传输警告。
+`ui/index.js` 通过 `window.QwenPaw.registerRoutes("qwenpaw-node-bridge", …)` 挂到 Settings →「扩展设置」→「QwenPaw Node Bridge」，使用宿主注入的 `React` / `antd` / `getApiUrl` / `getApiToken`。字段为地址、端口、用户名、认证方式、私钥来源、私钥路径或内容、口令、登录密码；保存后只显示「已配置 / 未配置」。未开 Web 认证时，私有/回环/组网来源直接可用；其他地址需在「受信任地址」块与 App 两侧配置。页面使用 HTTP 时显示明文传输警告。
 
 ### 测试
 

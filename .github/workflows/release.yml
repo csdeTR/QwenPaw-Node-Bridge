@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 校验 tag 与 plugin.json 一致
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c 'import json; print(json.load(open("plugin.json"))["version"])')
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 plugin.json 版本 v${VERSION} 不一致"
+            exit 1
+          fi
+
+      - name: 打包并生成校验和
+        run: |
+          set -euo pipefail
+          zip -r -X qwenpaw-node-bridge.zip plugin.json backend ui README.md \
+            -x 'backend/__pycache__/*' 'backend/tests/*'
+          sha256sum qwenpaw-node-bridge.zip > SHA256SUMS
+          ls -l qwenpaw-node-bridge.zip SHA256SUMS
+
+      - name: 创建 Release 并上传
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            qwenpaw-node-bridge.zip
+            SHA256SUMS

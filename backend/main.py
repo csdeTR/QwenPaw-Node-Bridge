@@ -59,6 +59,18 @@ from fastapi import (
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+try:  # 插件加载器两种导入方式都要兼容
+    from .i18n import resolve_lang as _resolve_lang, t as _t
+except ImportError:  # pragma: no cover - 顶层模块加载
+    try:
+        from i18n import resolve_lang as _resolve_lang, t as _t
+    except ImportError:
+        def _resolve_lang(request=None):  # type: ignore[no-redef]
+            return "zh"
+
+        def _t(text, lang="zh", **kwargs):  # type: ignore[no-redef]
+            return text.format(**kwargs) if kwargs else text
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -759,18 +771,37 @@ def _load_ssh_settings() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
+    """先以目标权限写临时文件，再原子替换。
+
+    旧写法先写后 chmod，窗口期内是 0644；凭据文件不能有这个窗口。
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
 def _save_ssh_settings(data: dict) -> None:
-    path = _ssh_settings_path()
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    _atomic_write_text(
+        _ssh_settings_path(),
+        json.dumps(data, ensure_ascii=False, indent=2),
+    )
 
 
 def _write_inline_key(key: str) -> None:
-    path = _ssh_key_path()
-    path.write_text(key, encoding="utf-8")
-    os.chmod(path, 0o600)
+    _atomic_write_text(_ssh_key_path(), key)
 
 
 def _read_inline_key() -> str | None:
@@ -945,22 +976,198 @@ def _http_token(request: Request) -> str | None:
     return token.strip() if token else None
 
 
-TRUSTED_HOST_HEADER = "x-qwenpaw-trusted-host"
+def _trusted_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """额外视为私有的来源网段；用于组网工具分配非标准地址段。"""
+    raw = os.environ.get("QWENPAW_BRIDGE_TRUSTED_CIDRS", "")
+    networks = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            logger.warning("忽略无效的 QWENPAW_BRIDGE_TRUSTED_CIDRS 项: %s", value)
+    return tuple(networks)
+
+
+def _proxy_enabled() -> bool:
+    return os.environ.get("QWENPAW_BRIDGE_TRUST_PROXY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _has_forwarded_headers(headers) -> bool:
+    return any(
+        headers.get(key)
+        for key in ("x-forwarded-for", "x-real-ip", "x-forwarded-host")
+    )
 
 
 def _is_private_client(host: str | None) -> bool:
-    """回环与私有地址；EasyTier/VPN 的 10.x 地址也属于这一类。"""
+    """回环、私有、链路本地、CGNAT 与额外组网网段。"""
     if not host:
         return False
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return address.is_private or address.is_loopback
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    if address.is_private or address.is_loopback or address.is_link_local:
+        return True
+    if address in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    return any(address in network for network in _trusted_networks())
 
 
-def _trusted_header(headers) -> bool:
-    return str(headers.get(TRUSTED_HOST_HEADER, "")).strip() == "1"
+def _normalize_host(raw: str) -> str | None:
+    value = (raw or "").strip().lower()
+    if not value:
+        return None
+    for prefix in ("https://", "http://"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    value = value.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return None
+        value = value[1:end]
+    else:
+        value = value.split(":", 1)[0]
+    value = value.rstrip(".")
+    return value or None
+
+
+def _forwarded_client(peer: str | None, headers) -> str | None:
+    """只在显式信任反代、且直连对端本身是私有/回环时采信转发头。"""
+    if not _proxy_enabled() or not _is_private_client(peer):
+        return None
+    forwarded = headers.get("x-forwarded-for", "")
+    if forwarded:
+        parts = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if parts:
+            # 只取最右一跳：它是可信反代追加的，左侧可由客户端伪造。
+            return parts[-1]
+    real_ip = headers.get("x-real-ip", "").strip()
+    return real_ip or None
+
+
+def _request_host(headers) -> str | None:
+    host = headers.get("host", "")
+    if _proxy_enabled():
+        forwarded = headers.get("x-forwarded-host", "")
+        if forwarded:
+            host = forwarded.split(",")[-1].strip()
+    return _normalize_host(host)
+
+
+def _trusted_addresses_path() -> Path:
+    return _data_dir() / "trusted_addresses.json"
+
+
+def _load_trusted_addresses() -> list[dict]:
+    try:
+        data = json.loads(_trusted_addresses_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        host = _normalize_host(str(item.get("host", "")))
+        source = str(item.get("source_cidr", "") or "").strip() or None
+        if host:
+            result.append({"host": host, "source_cidr": source})
+    return result
+
+
+def _save_trusted_addresses(items: list[dict]) -> None:
+    _atomic_write_text(
+        _trusted_addresses_path(),
+        json.dumps({"version": 1, "items": items}, ensure_ascii=False, indent=2),
+    )
+
+
+def _validate_trusted_addresses(body: dict) -> list[dict]:
+    items = body.get("items") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("items 必须是数组")
+    result = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("每一项必须是对象")
+        host = _normalize_host(str(item.get("host", "")))
+        if not host:
+            raise ValueError("地址不能为空")
+        if host in seen:
+            raise ValueError(f"地址重复: {host}")
+        seen.add(host)
+        source = str(item.get("source_cidr", "") or "").strip()
+        if source:
+            try:
+                ipaddress.ip_network(source, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"来源网段无效: {source}") from exc
+        result.append({"host": host, "source_cidr": source or None})
+    return result
+
+
+def _trusted_address_matches(host: str | None, client_ip: str | None) -> bool:
+    """Host 命中条目且来源 IP 命中条目网段。
+
+    未写 source_cidr 的条目不对公网来源生效；私有/组网来源在调用方已直接放行。
+    """
+    normalized = _normalize_host(host or "")
+    if not normalized or not client_ip:
+        return False
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    for item in _load_trusted_addresses():
+        if item["host"] != normalized or not item.get("source_cidr"):
+            continue
+        try:
+            if address in ipaddress.ip_network(item["source_cidr"], strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _sensitive_access_allowed(
+    *,
+    token: str | None,
+    client_host: str | None,
+    headers,
+) -> bool:
+    """敏感端点的统一访问策略。
+
+    开启 Web 认证时只认有效 token；未开启时放行以下任一种：
+    1. 来源是私有/回环/组网网段；
+    2. 请求 Host 命中 Bridge 受信任地址，且来源 IP 命中该条目的网段。
+    反代转发头未显式开启 TRUST_PROXY 时按不确定处理，不因回环而对公网放行。
+    """
+    if _ssh_auth_enabled():
+        return bool(_ssh_token_user(token))
+    forwarded = _forwarded_client(client_host, headers)
+    effective = forwarded or client_host
+    proxy_unknown = _has_forwarded_headers(headers) and not _proxy_enabled()
+    if not proxy_unknown and _is_private_client(effective):
+        return True
+    return _trusted_address_matches(_request_host(headers), effective)
 
 
 def _ssh_access_allowed(
@@ -969,15 +1176,11 @@ def _ssh_access_allowed(
     client_host: str | None,
     headers,
 ) -> bool:
-    """SSH 敏感端点的统一访问策略。
-
-    开了 Web 登录认证时只认有效 token；没开时只放行私有/回环地址，或 App/
-    Console 在用户显式确认后发来的受信任标记。标记不是密码学证明，公网部署
-    仍应开启认证与 HTTPS。
-    """
-    if _ssh_auth_enabled():
-        return bool(_ssh_token_user(token))
-    return _is_private_client(client_host) or _trusted_header(headers)
+    return _sensitive_access_allowed(
+        token=token,
+        client_host=client_host,
+        headers=headers,
+    )
 
 
 def _require_ssh_access(request: Request) -> None:
@@ -993,7 +1196,21 @@ def _require_ssh_access(request: Request) -> None:
         client_host=client_host,
         headers=request.headers,
     ):
-        raise HTTPException(401, "SSH requires authentication")
+        lang = _resolve_lang(request)
+        if not _ssh_auth_enabled():
+            # 给客户端一个可识别的 code，便于提示「去 Bridge 设置页添加受信任地址」。
+            raise HTTPException(
+                401,
+                {
+                    "code": "trusted_address_required",
+                    "message": _t(
+                        "来源地址不在私有网段；请开启登录认证，"
+                        "或在 Bridge 设置页添加受信任地址并绑定来源网段",
+                        lang,
+                    ),
+                },
+            )
+        raise HTTPException(401, _t("SSH 需要登录认证", lang))
 
 
 def _require_browser_access(request: Request) -> None:
@@ -1048,11 +1265,10 @@ def _load_pairing() -> dict:
 
 
 def _save_pairing(data: dict) -> None:
-    path = _pairing_path()
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    _atomic_write_text(
+        _pairing_path(),
+        json.dumps(data, ensure_ascii=False, indent=2),
+    )
 
 
 def _pair_payload(addresses: list[str], token: str) -> str:
@@ -1101,7 +1317,11 @@ def _require_pairing_access(request: Request) -> str:
         return user
     if not _pairing_auth_enabled():
         client_host = request.client.host if request.client else None
-        if _is_private_client(client_host) or _trusted_header(request.headers):
+        if _sensitive_access_allowed(
+            token=_http_token(request),
+            client_host=client_host,
+            headers=request.headers,
+        ):
             return "default"
     raise HTTPException(401, "Pairing requires authentication")
 
@@ -1486,8 +1706,6 @@ def _self_headers(request: Request) -> dict:
     token = _http_token(request)
     if token:
         headers["authorization"] = f"Bearer {token}"
-    elif _trusted_header(request.headers):
-        headers[TRUSTED_HOST_HEADER] = "1"
     agent_id = str(request.headers.get("x-agent-id", "")).strip()
     if agent_id:
         headers["x-agent-id"] = agent_id
@@ -2234,8 +2452,9 @@ class BridgePlugin:
             )
 
         @router.get("/ssh/settings")
-        async def ssh_settings():
+        async def ssh_settings(request: Request):
             """脱敏设置。私钥、口令与登录密码不回传。"""
+            _require_ssh_access(request)
             return _masked_ssh_settings()
 
         @router.put("/ssh/settings")
@@ -2252,8 +2471,9 @@ class BridgePlugin:
                 raise HTTPException(400, str(exc)) from exc
 
         @router.get("/ssh/config")
-        async def ssh_config():
+        async def ssh_config(request: Request):
             """给手机端的脱敏目标信息；私钥与口令永不在这里出现。"""
+            _require_ssh_access(request)
             data = _masked_ssh_settings()
             if not data["configured"]:
                 raise HTTPException(404, "SSH 目标尚未配置")
@@ -2265,6 +2485,27 @@ class BridgePlugin:
                 "key_configured": data["key_configured"],
                 "key_source": data["key_source"],
             }
+
+        @router.get("/trusted-addresses")
+        async def trusted_addresses(request: Request):
+            """Bridge 侧的受信任地址列表。
+
+            与 App 侧受信任地址是两套独立配置：敏感下发必须两边都命中。
+            """
+            _require_ssh_access(request)
+            return {"items": _load_trusted_addresses()}
+
+        @router.put("/trusted-addresses")
+        async def update_trusted_addresses(request: Request, body: dict):
+            """全量替换受信任地址。条目可带来源网段，抵御 Host 头伪造。"""
+            _require_ssh_access(request)
+            try:
+                items = _validate_trusted_addresses(body)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            _save_trusted_addresses(items)
+            logger.info("trusted addresses updated count=%s", len(items))
+            return {"items": items}
 
         @router.get("/ssh/credential")
         async def ssh_credential(request: Request):

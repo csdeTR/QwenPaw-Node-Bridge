@@ -6,8 +6,47 @@
 const host = window.QwenPaw.host;
 const React = host.React;
 const antd = host.antd;
-const h = React.createElement;
-const { Alert, Button, Card, Checkbox, Divider, Input, InputNumber, Radio, Select, Space, Switch, Typography, message } = antd;
+
+// 当前只有简体中文；表里留空，以后加英文时按中文原文登记即可。
+const TRANSLATIONS = { zh: {} };
+
+function currentLang() {
+  const lang = String(window.__qwenpawNodeBridgeLang || "zh").toLowerCase();
+  return lang.startsWith("zh") ? "zh" : "zh";
+}
+
+function t(text) {
+  if (typeof text !== "string" || !text) return text;
+  const table = TRANSLATIONS[currentLang()] || {};
+  return table[text] || text;
+}
+
+// 统一在渲染层翻译：字符串子节点与常见文本属性都过一遍 t()，
+// 避免逐条改 100 多处文案，也避免漏掉新增的块。
+const TEXT_PROPS = new Set([
+  "title",
+  "label",
+  "description",
+  "placeholder",
+  "hint",
+  "message",
+  "text",
+  "okText",
+  "cancelText",
+  "content",
+]);
+
+const h = (type, props, ...children) => {
+  const nextProps = props ? { ...props } : props;
+  if (nextProps) {
+    for (const key of TEXT_PROPS) {
+      if (typeof nextProps[key] === "string") nextProps[key] = t(nextProps[key]);
+    }
+  }
+  const nextChildren = children.map((child) => (typeof child === "string" ? t(child) : child));
+  return React.createElement(type, nextProps, ...nextChildren);
+};
+const { Alert, Button, Card, Divider, Input, InputNumber, Radio, Select, Space, Switch, Typography, message } = antd;
 const Text = Typography.Text;
 const Paragraph = Typography.Paragraph;
 
@@ -42,12 +81,12 @@ const UPDATE_STATUS_PATH = "/plugins/qwenpaw-node-bridge/update/status";
 const UPDATE_SETTINGS_PATH = "/plugins/qwenpaw-node-bridge/update/settings";
 const UPDATE_CHECK_PATH = "/plugins/qwenpaw-node-bridge/update/check";
 const UPDATE_REPO_URL = "https://github.com/csdeTR/QwenPaw-Node-Bridge";
+const TRUSTED_ADDRESSES_PATH = "/plugins/qwenpaw-node-bridge/trusted-addresses";
 
-async function request(path, method, body, options) {
+async function request(path, method, body) {
   const headers = {};
   const token = host.getApiToken ? host.getApiToken() : "";
   if (token) headers.Authorization = "Bearer " + token;
-  if (options && options.trusted) headers["X-QwenPaw-Trusted-Host"] = "1";
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const response = await fetch(host.getApiUrl(path), {
     method,
@@ -61,6 +100,10 @@ async function request(path, method, body, options) {
     try {
       const parsed = JSON.parse(text);
       detail = parsed.detail || text;
+      // 0.5.1 起访问策略错误用 {code, message} 结构返回，别把对象直接当字符串。
+      if (detail && typeof detail === "object") {
+        detail = detail.message || detail.code || JSON.stringify(detail);
+      }
     } catch (_) {
       // 保持原文
     }
@@ -100,8 +143,6 @@ function SshSettingsPanel() {
   const [privateKey, setPrivateKey] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [passphrase, setPassphrase] = React.useState("");
-  // 未开 Web 认证时，公网地址需要用户在这里显式确认「仅我可访问」；默认不勾。
-  const [trusted, setTrusted] = React.useState(false);
 
   const update = (patch) => setForm((current) => ({ ...current, ...patch }));
 
@@ -160,7 +201,7 @@ function SshSettingsPanel() {
     if (passphrase) body.passphrase = passphrase;
     setSaving(true);
     try {
-      const data = await request(SSH_API_PATH, "PUT", body, { trusted });
+      const data = await request(SSH_API_PATH, "PUT", body);
       setKeyConfigured(Boolean(data.key_configured));
       setPasswordConfigured(Boolean(data.password_configured));
       setPassphraseConfigured(Boolean(data.passphrase_configured));
@@ -204,7 +245,7 @@ function SshSettingsPanel() {
     h(
       Paragraph,
       { type: "secondary" },
-      "保存后手机端可经配套插件中继到该目标。未开启 Web 登录认证时，仅私有/回环地址或下方显式勾选「此地址仅我可访问」的地址可以读取凭据与保存设置；公网部署请开启登录认证与 HTTPS。该勾选只是用户确认，不是密码学保证。",
+      "保存后手机端可经配套插件中继到该目标。未开启 Web 登录认证时，仅私有/回环/CGNAT/组网来源，或 App 与 Bridge 两侧都命中「受信任地址」的来源可以读取凭据与保存设置；公网部署请开启登录认证与 HTTPS。",
     ),
     h(
       Space,
@@ -334,15 +375,6 @@ function SshSettingsPanel() {
           : "目标尚未配置。",
       ),
       h(
-        Checkbox,
-        {
-          checked: trusted,
-          onChange: (event) => setTrusted(Boolean(event.target.checked)),
-          style: { marginBottom: 12 },
-        },
-        "此地址仅我可访问（未开 Web 认证时需要）",
-      ),
-      h(
         Button,
         { type: "primary", loading: saving, onClick: save },
         "保存",
@@ -374,7 +406,10 @@ function PairingPanel() {
     return addressText
       .split(/\s+/)
       .map((line) => line.trim())
-      .filter(Boolean);
+      .filter(Boolean)
+      .map((line) =>
+        /^[a-z][a-z0-9+.-]*:\/\//i.test(line) ? line : "http://" + line,
+      );
   }
 
   async function loadList() {
@@ -513,7 +548,7 @@ function PairingPanel() {
     ),
     h(
       Field,
-      { label: "服务器地址", hint: "一行一个。第一条为默认地址，其余作为备用按顺序回退。" },
+      { label: "服务器地址", hint: "一行一个，第一条为默认地址。未写协议时按 http 处理；公网地址请写 https://。" },
       h(Input.TextArea, {
         rows: 2,
         value: addressText,
@@ -1094,6 +1129,137 @@ function AboutPanel() {
   );
 }
 
+/** 受信任地址：与 App 侧配合，决定敏感下发是否放行。 */
+function TrustedAddressesPanel() {
+  const [items, setItems] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+  const [hostInput, setHostInput] = React.useState("");
+  const [sourceInput, setSourceInput] = React.useState("");
+
+  const load = React.useCallback(() => {
+    setLoading(true);
+    request(TRUSTED_ADDRESSES_PATH, "GET")
+      .then((data) => setItems(Array.isArray(data.items) ? data.items : []))
+      .catch((error) => message.error(error.message || "读取受信任地址失败"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  const persist = async (next) => {
+    setSaving(true);
+    try {
+      const data = await request(TRUSTED_ADDRESSES_PATH, "PUT", { items: next });
+      setItems(Array.isArray(data.items) ? data.items : next);
+      message.success("受信任地址已保存");
+      return true;
+    } catch (error) {
+      message.error(error.message || "保存受信任地址失败");
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const add = async () => {
+    const hostValue = hostInput.trim();
+    if (!hostValue) {
+      message.warning("地址不能为空");
+      return;
+    }
+    const source = sourceInput.trim();
+    const key = hostValue.toLowerCase();
+    if (items.some((item) => item.host === key)) {
+      message.warning("该地址已在列表中");
+      return;
+    }
+    if (await persist([...items, { host: hostValue, source_cidr: source || null }])) {
+      setHostInput("");
+      setSourceInput("");
+    }
+  };
+
+  const remove = async (target) => {
+    await persist(items.filter((item) => item.host !== target));
+  };
+
+  return h(
+    "div",
+    null,
+    h(Alert, {
+      type: "info",
+      showIcon: true,
+      style: { marginBottom: 16 },
+      message: "App 与 Bridge 两侧都要配置同一地址",
+      description:
+        "敏感下发（SSH 凭据、配对令牌、浏览器修复等）只有 App 的受信任地址和这里的条目同时命中才放行。域名或非内网来源必须填写来源网段，否则仅对私有/组网来源生效。",
+    }),
+    h(
+      Space,
+      { direction: "vertical", size: 12, style: { width: "100%" } },
+      h(
+        Space,
+        { wrap: true },
+        h(Input, {
+          value: hostInput,
+          onChange: (event) => setHostInput(event.target.value),
+          placeholder: "地址或域名，例如 mynas.easytier.top",
+          style: { width: 280 },
+        }),
+        h(Input, {
+          value: sourceInput,
+          onChange: (event) => setSourceInput(event.target.value),
+          placeholder: "来源网段，例如 100.64.0.0/10",
+          style: { width: 240 },
+        }),
+        h(Button, { type: "primary", loading: saving, onClick: add }, "添加"),
+      ),
+      loading
+        ? h(Text, { type: "secondary" }, "读取中…")
+        : items.length === 0
+          ? h(Text, { type: "secondary" }, "还没有添加受信任地址")
+          : h(
+              Space,
+              { direction: "vertical", size: 8, style: { width: "100%" } },
+              ...items.map((item) =>
+                h(
+                  "div",
+                  {
+                    key: item.host,
+                    style: {
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      padding: "8px 12px",
+                      border: "1px solid rgba(128,128,128,0.25)",
+                      borderRadius: 8,
+                    },
+                  },
+                  h(
+                    "div",
+                    null,
+                    h(Text, { strong: true }, item.host),
+                    h(
+                      Text,
+                      { type: "secondary", style: { marginLeft: 8 } },
+                      item.source_cidr || "仅私有/组网来源",
+                    ),
+                  ),
+                  h(
+                    Button,
+                    { size: "small", danger: true, onClick: () => remove(item.host) },
+                    "删除",
+                  ),
+                ),
+              ),
+            ),
+    ),
+  );
+}
+
 /**
  * 插件设置页外壳。
  *
@@ -1113,6 +1279,12 @@ const BLOCKS = [
     title: "SSH 中继",
     description: "配置手机端「Bridge 中继」使用的 SSH 目标。",
     render: () => h(SshSettingsPanel),
+  },
+  {
+    id: "trusted",
+    title: "受信任地址",
+    description: "与 App 侧配合，决定哪些来源可以下发 SSH 凭据、配对令牌等敏感内容。",
+    render: () => h(TrustedAddressesPanel),
   },
   {
     id: "logs",
@@ -1188,6 +1360,16 @@ function BridgeSettingsPage() {
     ),
   );
 }
+
+// 读取 Console 语言；当前只有 zh，读取失败也不影响界面。
+request("/settings/language", "GET")
+  .then((data) => {
+    const lang = data && (data.language || data.value);
+    if (lang) window.__qwenpawNodeBridgeLang = String(lang);
+  })
+  .catch(() => {
+    // 旧版核心可能没有这个端点，保持默认中文。
+  });
 
 if (!window.__qwenpawNodeBridgeSshRoute) {
   window.__qwenpawNodeBridgeSshRoute = true;
