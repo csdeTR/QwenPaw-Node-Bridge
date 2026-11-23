@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """运行时语言判定与译文回退。当前只有中文。"""
+import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
@@ -12,6 +16,20 @@ import i18n  # noqa: E402  pylint: disable=wrong-import-position
 
 
 class ResolveLangTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.data_dir = temp.name
+        env = mock.patch.dict(
+            os.environ,
+            {"QWENPAW_NODE_BRIDGE_DATA_DIR": self.data_dir},
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        console = mock.patch.object(i18n, "_console_language", return_value=None)
+        console.start()
+        self.addCleanup(console.stop)
+
     def test_defaults_to_chinese(self):
         self.assertEqual("zh", i18n.resolve_lang(None))
 
@@ -35,6 +53,47 @@ class ResolveLangTest(unittest.TestCase):
             headers={"accept-language": "fr-FR"},
         )
         self.assertEqual("zh", i18n.resolve_lang(request))
+
+
+class BridgeLanguageTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.data_dir = temp.name
+        env = mock.patch.dict(
+            os.environ,
+            {"QWENPAW_NODE_BRIDGE_DATA_DIR": self.data_dir},
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        console = mock.patch.object(i18n, "_console_language", return_value=None)
+        console.start()
+        self.addCleanup(console.stop)
+
+    def _write(self, payload):
+        path = Path(self.data_dir) / "bridge_settings.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_bridge_language_precedes_request(self):
+        self._write({"language": "en"})
+        request = SimpleNamespace(
+            query_params={"lang": "zh"},
+            headers={"accept-language": "zh-CN"},
+        )
+        with mock.patch.object(i18n, "SUPPORTED", ("zh", "en")):
+            self.assertEqual("en", i18n.resolve_lang(request))
+
+    def test_bad_file_falls_back_to_request(self):
+        (Path(self.data_dir) / "bridge_settings.json").write_text(
+            "{not json",
+            encoding="utf-8",
+        )
+        request = SimpleNamespace(query_params={"lang": "zh"}, headers={})
+        self.assertEqual("zh", i18n.resolve_lang(request))
+
+    def test_unsupported_bridge_language_is_ignored(self):
+        self._write({"language": "fr"})
+        self.assertEqual("zh", i18n.resolve_lang(None))
 
 
 class TranslationTest(unittest.TestCase):

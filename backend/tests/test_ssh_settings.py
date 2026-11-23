@@ -190,7 +190,7 @@ class SshSettingsTest(unittest.TestCase):
                 main,
                 "_load_trusted_addresses",
                 return_value=[
-                    {"host": "chat.example.com", "source_cidr": "8.8.8.0/24"},
+                    {"host": "chat.example.com"},
                 ],
             ):
                 main._require_ssh_access(request)

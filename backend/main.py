@@ -60,11 +60,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 try:  # 插件加载器两种导入方式都要兼容
-    from .i18n import resolve_lang as _resolve_lang, t as _t
+    from .i18n import SUPPORTED as _SUPPORTED_LANGUAGES, resolve_lang as _resolve_lang, t as _t
 except ImportError:  # pragma: no cover - 顶层模块加载
     try:
-        from i18n import resolve_lang as _resolve_lang, t as _t
+        from i18n import SUPPORTED as _SUPPORTED_LANGUAGES, resolve_lang as _resolve_lang, t as _t
     except ImportError:
+        _SUPPORTED_LANGUAGES = ("zh",)
+
         def _resolve_lang(request=None):  # type: ignore[no-redef]
             return "zh"
 
@@ -1071,6 +1073,27 @@ def _trusted_addresses_path() -> Path:
     return _data_dir() / "trusted_addresses.json"
 
 
+def _bridge_settings_path() -> Path:
+    return _data_dir() / "bridge_settings.json"
+
+
+def _load_bridge_language() -> str:
+    """Bridge 界面语言；缺失或非法时回退中文。"""
+    try:
+        data = json.loads(_bridge_settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "zh"
+    language = str(data.get("language") or "").lower() if isinstance(data, dict) else ""
+    return language if language in _SUPPORTED_LANGUAGES else "zh"
+
+
+def _save_bridge_language(language: str) -> None:
+    _atomic_write_text(
+        _bridge_settings_path(),
+        json.dumps({"language": language}, ensure_ascii=False, indent=2),
+    )
+
+
 def _load_trusted_addresses() -> list[dict]:
     try:
         data = json.loads(_trusted_addresses_path().read_text(encoding="utf-8"))
@@ -1084,9 +1107,8 @@ def _load_trusted_addresses() -> list[dict]:
         if not isinstance(item, dict):
             continue
         host = _normalize_host(str(item.get("host", "")))
-        source = str(item.get("source_cidr", "") or "").strip() or None
         if host:
-            result.append({"host": host, "source_cidr": source})
+            result.append({"host": host})
     return result
 
 
@@ -1112,39 +1134,19 @@ def _validate_trusted_addresses(body: dict) -> list[dict]:
         if host in seen:
             raise ValueError(f"地址重复: {host}")
         seen.add(host)
-        source = str(item.get("source_cidr", "") or "").strip()
-        if source:
-            try:
-                ipaddress.ip_network(source, strict=False)
-            except ValueError as exc:
-                raise ValueError(f"来源网段无效: {source}") from exc
-        result.append({"host": host, "source_cidr": source or None})
+        result.append({"host": host})
     return result
 
 
-def _trusted_address_matches(host: str | None, client_ip: str | None) -> bool:
-    """Host 命中条目且来源 IP 命中条目网段。
+def _trusted_address_matches(host: str | None) -> bool:
+    """请求 Host 命中受信任的连接即放行。
 
-    未写 source_cidr 的条目不对公网来源生效；私有/组网来源在调用方已直接放行。
+    受信任的连接的语义是「我确认这个地址/域名是私有的」；不再绑定来源网段。
     """
     normalized = _normalize_host(host or "")
-    if not normalized or not client_ip:
+    if not normalized:
         return False
-    try:
-        address = ipaddress.ip_address(client_ip)
-    except ValueError:
-        return False
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
-        address = address.ipv4_mapped
-    for item in _load_trusted_addresses():
-        if item["host"] != normalized or not item.get("source_cidr"):
-            continue
-        try:
-            if address in ipaddress.ip_network(item["source_cidr"], strict=False):
-                return True
-        except ValueError:
-            continue
-    return False
+    return any(item["host"] == normalized for item in _load_trusted_addresses())
 
 
 def _sensitive_access_allowed(
@@ -1157,7 +1159,7 @@ def _sensitive_access_allowed(
 
     开启 Web 认证时只认有效 token；未开启时放行以下任一种：
     1. 来源是私有/回环/组网网段；
-    2. 请求 Host 命中 Bridge 受信任地址，且来源 IP 命中该条目的网段。
+    2. 请求 Host 命中 Bridge 的受信任的连接。
     反代转发头未显式开启 TRUST_PROXY 时按不确定处理，不因回环而对公网放行。
     """
     if _ssh_auth_enabled():
@@ -1167,7 +1169,7 @@ def _sensitive_access_allowed(
     proxy_unknown = _has_forwarded_headers(headers) and not _proxy_enabled()
     if not proxy_unknown and _is_private_client(effective):
         return True
-    return _trusted_address_matches(_request_host(headers), effective)
+    return _trusted_address_matches(_request_host(headers))
 
 
 def _ssh_access_allowed(
@@ -1198,14 +1200,14 @@ def _require_ssh_access(request: Request) -> None:
     ):
         lang = _resolve_lang(request)
         if not _ssh_auth_enabled():
-            # 给客户端一个可识别的 code，便于提示「去 Bridge 设置页添加受信任地址」。
+            # 给客户端一个可识别的 code，便于提示「去 Bridge 设置页添加受信任的连接」。
             raise HTTPException(
                 401,
                 {
                     "code": "trusted_address_required",
                     "message": _t(
-                        "来源地址不在私有网段；请开启登录认证，"
-                        "或在 Bridge 设置页添加受信任地址并绑定来源网段",
+                        "来源地址不在私有网段；请开启 Web 登录认证，"
+                        "或在 Bridge 设置页添加受信任的连接",
                         lang,
                     ),
                 },
@@ -2488,24 +2490,44 @@ class BridgePlugin:
 
         @router.get("/trusted-addresses")
         async def trusted_addresses(request: Request):
-            """Bridge 侧的受信任地址列表。
+            """Bridge 侧的受信任的连接列表。
 
-            与 App 侧受信任地址是两套独立配置：敏感下发必须两边都命中。
+            与 App 侧受信任的连接是两套独立配置：敏感下发必须两边都命中。
             """
             _require_ssh_access(request)
             return {"items": _load_trusted_addresses()}
 
         @router.put("/trusted-addresses")
         async def update_trusted_addresses(request: Request, body: dict):
-            """全量替换受信任地址。条目可带来源网段，抵御 Host 头伪造。"""
+            """全量替换受信任的连接。条目只含地址或域名。"""
             _require_ssh_access(request)
             try:
                 items = _validate_trusted_addresses(body)
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             _save_trusted_addresses(items)
-            logger.info("trusted addresses updated count=%s", len(items))
+            logger.info("trusted connections updated count=%s", len(items))
             return {"items": items}
+
+        @router.get("/language")
+        async def get_language(request: Request):
+            """Bridge 界面语言；与 Console 语言分开存储。"""
+            _require_ssh_access(request)
+            return {
+                "language": _load_bridge_language(),
+                "supported": list(_SUPPORTED_LANGUAGES),
+            }
+
+        @router.put("/language")
+        async def update_language(request: Request, body: dict):
+            """切换 Bridge 界面语言；当前只有简体中文。"""
+            _require_ssh_access(request)
+            raw = body.get("language") if isinstance(body, dict) else None
+            language = str(raw or "").strip().lower()
+            if language not in _SUPPORTED_LANGUAGES:
+                raise HTTPException(400, "不支持的语言")
+            _save_bridge_language(language)
+            return {"language": language}
 
         @router.get("/ssh/credential")
         async def ssh_credential(request: Request):

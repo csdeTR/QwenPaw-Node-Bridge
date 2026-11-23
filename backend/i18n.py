@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,26 @@ def _primary_language(value: str | None) -> str | None:
     return first.split("-", 1)[0]
 
 
+def _bridge_language() -> str | None:
+    """Bridge 插件自己的语言设置；读不到时返回 None。"""
+    try:
+        override = os.environ.get("QWENPAW_NODE_BRIDGE_DATA_DIR")
+        if override:
+            root = Path(override).expanduser()
+        else:
+            from qwenpaw.constant import WORKING_DIR
+
+            root = Path(WORKING_DIR) / "plugin_data" / "qwenpaw-node-bridge"
+        data = json.loads(
+            (root / "bridge_settings.json").read_text(encoding="utf-8"),
+        )
+        language = data.get("language") if isinstance(data, dict) else None
+        primary = _primary_language(str(language) if language else None)
+        return primary if primary in SUPPORTED else None
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 def _console_language() -> str | None:
     """Console 的语言设置；读不到时返回 None。"""
     try:
@@ -40,7 +61,10 @@ def _console_language() -> str | None:
 
 
 def resolve_lang(request=None) -> str:
-    """按 ?lang → Accept-Language → Console 语言 → 中文 的顺序判定。"""
+    """按 Bridge 语言 → ?lang → Accept-Language → Console 语言 → 中文 的顺序判定。"""
+    bridge = _bridge_language()
+    if bridge:
+        return bridge
     candidate = None
     if request is not None:
         query = getattr(request, "query_params", None)

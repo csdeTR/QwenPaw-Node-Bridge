@@ -1,6 +1,6 @@
 {
   "id": "qwenpaw-node-bridge",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "name": "QwenPaw Node Bridge",
   "description": "为 QwenPaw Node Android 客户端提供桥接端点",
   "author": "QwenPaw Node",

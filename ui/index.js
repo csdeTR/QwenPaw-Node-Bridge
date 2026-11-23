@@ -21,6 +21,15 @@ function t(text) {
   return table[text] || text;
 }
 
+const LANGUAGE_EVENT = "qwenpaw-node-bridge-language-change";
+
+/** 更新当前语言并通知设置页外壳重渲染。 */
+function applyLanguage(language) {
+  if (!language) return;
+  window.__qwenpawNodeBridgeLang = String(language);
+  window.dispatchEvent(new CustomEvent(LANGUAGE_EVENT));
+}
+
 // 统一在渲染层翻译：字符串子节点与常见文本属性都过一遍 t()，
 // 避免逐条改 100 多处文案，也避免漏掉新增的块。
 const TEXT_PROPS = new Set([
@@ -82,6 +91,7 @@ const UPDATE_SETTINGS_PATH = "/plugins/qwenpaw-node-bridge/update/settings";
 const UPDATE_CHECK_PATH = "/plugins/qwenpaw-node-bridge/update/check";
 const UPDATE_REPO_URL = "https://github.com/csdeTR/QwenPaw-Node-Bridge";
 const TRUSTED_ADDRESSES_PATH = "/plugins/qwenpaw-node-bridge/trusted-addresses";
+const LANGUAGE_PATH = "/plugins/qwenpaw-node-bridge/language";
 
 async function request(path, method, body) {
   const headers = {};
@@ -245,7 +255,7 @@ function SshSettingsPanel() {
     h(
       Paragraph,
       { type: "secondary" },
-      "保存后手机端可经配套插件中继到该目标。未开启 Web 登录认证时，仅私有/回环/CGNAT/组网来源，或 App 与 Bridge 两侧都命中「受信任地址」的来源可以读取凭据与保存设置；公网部署请开启登录认证与 HTTPS。",
+      "保存后手机端可经配套插件中继到该目标。敏感内容只在客户端通过域名或非 10/172/192 内网地址访问、可能暴露在公网，并且未开启 Web 登录认证、未配置 SSL/HTTPS 时受限；私有内网地址、同时开启登录认证与 HTTPS 的地址，以及「受信任的连接」中的地址都不设限。",
     ),
     h(
       Space,
@@ -1129,19 +1139,18 @@ function AboutPanel() {
   );
 }
 
-/** 受信任地址：与 App 侧配合，决定敏感下发是否放行。 */
+/** 受信任的连接：与 App 侧配合，决定敏感下发是否放行。 */
 function TrustedAddressesPanel() {
   const [items, setItems] = React.useState([]);
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [hostInput, setHostInput] = React.useState("");
-  const [sourceInput, setSourceInput] = React.useState("");
 
   const load = React.useCallback(() => {
     setLoading(true);
     request(TRUSTED_ADDRESSES_PATH, "GET")
       .then((data) => setItems(Array.isArray(data.items) ? data.items : []))
-      .catch((error) => message.error(error.message || "读取受信任地址失败"))
+      .catch((error) => message.error(error.message || "读取受信任的连接失败"))
       .finally(() => setLoading(false));
   }, []);
 
@@ -1154,10 +1163,10 @@ function TrustedAddressesPanel() {
     try {
       const data = await request(TRUSTED_ADDRESSES_PATH, "PUT", { items: next });
       setItems(Array.isArray(data.items) ? data.items : next);
-      message.success("受信任地址已保存");
+      message.success("受信任的连接已保存");
       return true;
     } catch (error) {
-      message.error(error.message || "保存受信任地址失败");
+      message.error(error.message || "保存受信任的连接失败");
       return false;
     } finally {
       setSaving(false);
@@ -1170,15 +1179,13 @@ function TrustedAddressesPanel() {
       message.warning("地址不能为空");
       return;
     }
-    const source = sourceInput.trim();
     const key = hostValue.toLowerCase();
     if (items.some((item) => item.host === key)) {
       message.warning("该地址已在列表中");
       return;
     }
-    if (await persist([...items, { host: hostValue, source_cidr: source || null }])) {
+    if (await persist([...items, { host: hostValue }])) {
       setHostInput("");
-      setSourceInput("");
     }
   };
 
@@ -1193,9 +1200,9 @@ function TrustedAddressesPanel() {
       type: "info",
       showIcon: true,
       style: { marginBottom: 16 },
-      message: "App 与 Bridge 两侧都要配置同一地址",
+      message: "App 与 Bridge 两侧都要添加同一地址",
       description:
-        "敏感下发（SSH 凭据、配对令牌、浏览器修复等）只有 App 的受信任地址和这里的条目同时命中才放行。域名或非内网来源必须填写来源网段，否则仅对私有/组网来源生效。",
+        "只有客户端通过域名或非常见内网地址（如10/172/192等）访问QwenPaw，并且未开启 Web 登录认证、未配置 SSL/HTTPS 时，敏感下发才会受限。「受信任的连接」应当用于手动授权的私有网络地址，而非作为绕过QwenPaw Node安全防护的便利选项。",
     }),
     h(
       Space,
@@ -1207,20 +1214,14 @@ function TrustedAddressesPanel() {
           value: hostInput,
           onChange: (event) => setHostInput(event.target.value),
           placeholder: "地址或域名，例如 mynas.easytier.top",
-          style: { width: 280 },
-        }),
-        h(Input, {
-          value: sourceInput,
-          onChange: (event) => setSourceInput(event.target.value),
-          placeholder: "来源网段，例如 100.64.0.0/10",
-          style: { width: 240 },
+          style: { width: 320 },
         }),
         h(Button, { type: "primary", loading: saving, onClick: add }, "添加"),
       ),
       loading
         ? h(Text, { type: "secondary" }, "读取中…")
         : items.length === 0
-          ? h(Text, { type: "secondary" }, "还没有添加受信任地址")
+          ? h(Text, { type: "secondary" }, "还没有添加受信任的连接")
           : h(
               Space,
               { direction: "vertical", size: 8, style: { width: "100%" } },
@@ -1238,16 +1239,7 @@ function TrustedAddressesPanel() {
                       borderRadius: 8,
                     },
                   },
-                  h(
-                    "div",
-                    null,
-                    h(Text, { strong: true }, item.host),
-                    h(
-                      Text,
-                      { type: "secondary", style: { marginLeft: 8 } },
-                      item.source_cidr || "仅私有/组网来源",
-                    ),
-                  ),
+                  h(Text, { strong: true }, item.host),
                   h(
                     Button,
                     { size: "small", danger: true, onClick: () => remove(item.host) },
@@ -1257,6 +1249,64 @@ function TrustedAddressesPanel() {
               ),
             ),
     ),
+  );
+}
+
+/** 语言：当前只有简体中文，保存后立即按新语言重渲染。 */
+function LanguagePanel() {
+  const [language, setLanguage] = React.useState(
+    String(window.__qwenpawNodeBridgeLang || "zh"),
+  );
+  const [supported, setSupported] = React.useState(["zh"]);
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+
+  React.useEffect(() => {
+    request(LANGUAGE_PATH, "GET")
+      .then((data) => {
+        if (data && data.language) setLanguage(String(data.language));
+        if (data && Array.isArray(data.supported) && data.supported.length) {
+          setSupported(data.supported.map(String));
+        }
+      })
+      .catch((error) => message.error(error.message || "读取语言设置失败"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const save = async (next) => {
+    setSaving(true);
+    try {
+      const data = await request(LANGUAGE_PATH, "PUT", { language: next });
+      const applied = String((data && data.language) || next);
+      setLanguage(applied);
+      applyLanguage(applied);
+      message.success("语言设置已保存");
+    } catch (error) {
+      message.error(error.message || "保存语言设置失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return h(
+    Space,
+    { direction: "vertical", size: 12, style: { width: "100%" } },
+    h(
+      Text,
+      { type: "secondary" },
+      "语言只影响 Bridge 自己的提示与设置页，不改变 QwenPaw 控制台的语言。",
+    ),
+    h(Select, {
+      value: language,
+      loading,
+      disabled: saving,
+      style: { width: 220 },
+      onChange: save,
+      options: supported.map((code) => ({
+        value: code,
+        label: { zh: "简体中文" }[code] || code,
+      })),
+    }),
   );
 }
 
@@ -1282,8 +1332,8 @@ const BLOCKS = [
   },
   {
     id: "trusted",
-    title: "受信任地址",
-    description: "与 App 侧配合，决定哪些来源可以下发 SSH 凭据、配对令牌等敏感内容。",
+    title: "受信任的连接",
+    description: "与 App 侧配合，决定哪些地址可以下发 SSH 凭据、配对令牌等敏感内容。",
     render: () => h(TrustedAddressesPanel),
   },
   {
@@ -1291,6 +1341,12 @@ const BLOCKS = [
     title: "插件日志",
     description: "查看设置变更、SSH 连接与修复动作的最近记录；内容已在服务端脱敏。",
     render: () => h(LogsPanel),
+  },
+  {
+    id: "language",
+    title: "语言",
+    description: "设置 Bridge 设置页与后端提示使用的语言。",
+    render: () => h(LanguagePanel),
   },
   {
     id: "about",
@@ -1302,6 +1358,14 @@ const BLOCKS = [
 
 function BridgeSettingsPage() {
   const [openId, setOpenId] = React.useState(BLOCKS[0] ? BLOCKS[0].id : null);
+
+  // 语言切换后重渲染整个设置页；文案在 h() 的渲染层统一翻译。
+  const [, setLanguageTick] = React.useState(0);
+  React.useEffect(() => {
+    const onChange = () => setLanguageTick((value) => value + 1);
+    window.addEventListener(LANGUAGE_EVENT, onChange);
+    return () => window.removeEventListener(LANGUAGE_EVENT, onChange);
+  }, []);
 
   // 页面加载时读一次状态，有新版本就弹一次轻提示。放在外壳而不是「关于」块里：
   // 块只有展开时才挂载，放在块里会导致没展开就永远不提示。
@@ -1361,11 +1425,20 @@ function BridgeSettingsPage() {
   );
 }
 
-// 读取 Console 语言；当前只有 zh，读取失败也不影响界面。
-request("/settings/language", "GET")
-  .then((data) => {
-    const lang = data && (data.language || data.value);
-    if (lang) window.__qwenpawNodeBridgeLang = String(lang);
+// 语言优先级与后端一致：Bridge 语言 → Console 语言 → 中文。
+// 当前只有 zh，读取失败也不影响界面。
+request(LANGUAGE_PATH, "GET")
+  .then((data) => (data && data.language ? String(data.language) : null))
+  .catch(() => null)
+  .then((lang) => {
+    if (lang) {
+      applyLanguage(lang);
+      return;
+    }
+    return request("/settings/language", "GET").then((data) => {
+      const fallback = data && (data.language || data.value);
+      if (fallback) applyLanguage(fallback);
+    });
   })
   .catch(() => {
     // 旧版核心可能没有这个端点，保持默认中文。

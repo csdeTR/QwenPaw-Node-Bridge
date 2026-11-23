@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""敏感端点访问策略：来源网段、两侧受信任地址、反代与文件权限。"""
+"""敏感端点访问策略：私网来源、受信任的连接、反代与文件权限。"""
 import os
 import stat
 import sys
@@ -39,14 +39,14 @@ class TrustedAddressTest(unittest.TestCase):
             main,
             "_load_trusted_addresses",
             return_value=[
-                {"host": "chat.example.com", "source_cidr": "8.8.8.0/24"},
-                {"host": "nomatch.example.com", "source_cidr": None},
+                {"host": "chat.example.com"},
+                {"host": "nomatch.example.com"},
             ],
         )
         self.trusted.start()
         self.addCleanup(self.trusted.stop)
 
-    def test_host_and_source_must_both_match(self):
+    def test_host_match_allows_any_public_source(self):
         headers = {"host": "chat.example.com"}
         with mock.patch.object(main, "_ssh_auth_enabled", return_value=False):
             self.assertTrue(
@@ -56,7 +56,7 @@ class TrustedAddressTest(unittest.TestCase):
                     headers=headers,
                 ),
             )
-            self.assertFalse(
+            self.assertTrue(
                 main._sensitive_access_allowed(
                     token=None,
                     client_host="1.1.1.1",
@@ -64,13 +64,13 @@ class TrustedAddressTest(unittest.TestCase):
                 ),
             )
 
-    def test_entry_without_source_does_not_allow_public(self):
+    def test_unknown_host_does_not_allow_public(self):
         with mock.patch.object(main, "_ssh_auth_enabled", return_value=False):
             self.assertFalse(
                 main._sensitive_access_allowed(
                     token=None,
                     client_host="8.8.8.9",
-                    headers={"host": "nomatch.example.com"},
+                    headers={"host": "other.example.com"},
                 ),
             )
 
@@ -126,7 +126,7 @@ class ProxyTest(unittest.TestCase):
                     main,
                     "_load_trusted_addresses",
                     return_value=[
-                        {"host": "chat.example.com", "source_cidr": "8.8.8.0/24"},
+                        {"host": "chat.example.com"},
                     ],
                 ):
                     self.assertTrue(
@@ -142,29 +142,42 @@ class ProxyTest(unittest.TestCase):
 
 
 class ValidateAddressesTest(unittest.TestCase):
-    def test_normalizes_and_accepts(self):
+    def test_normalizes_and_ignores_legacy_cidr(self):
         items = main._validate_trusted_addresses(
             {"items": [{"host": "HTTPS://Chat.Example.com:8443/x", "source_cidr": "8.8.8.0/24"}]},
         )
-        self.assertEqual(
-            [{"host": "chat.example.com", "source_cidr": "8.8.8.0/24"}],
-            items,
-        )
+        self.assertEqual([{"host": "chat.example.com"}], items)
 
-    def test_rejects_invalid_cidr_and_duplicates(self):
+    def test_rejects_missing_host_and_duplicates(self):
         with self.assertRaises(ValueError):
-            main._validate_trusted_addresses(
-                {"items": [{"host": "a.example.com", "source_cidr": "not-a-cidr"}]},
-            )
+            main._validate_trusted_addresses({"items": [{"host": "  "}]})
         with self.assertRaises(ValueError):
             main._validate_trusted_addresses(
                 {
                     "items": [
-                        {"host": "a.example.com", "source_cidr": "8.8.8.0/24"},
-                        {"host": "a.example.com", "source_cidr": "1.1.1.0/24"},
+                        {"host": "a.example.com"},
+                        {"host": "A.example.com"},
                     ],
                 },
             )
+
+
+class LegacyTrustedFileTest(unittest.TestCase):
+    def test_legacy_source_cidr_is_read_but_dropped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.dict(
+                os.environ,
+                {"QWENPAW_NODE_BRIDGE_DATA_DIR": temp_dir},
+            ):
+                path = Path(temp_dir) / "trusted_addresses.json"
+                path.write_text(
+                    '{"version":1,"items":[{"host":"OLD.Example.com","source_cidr":"8.8.8.0/24"}]}',
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    [{"host": "old.example.com"}],
+                    main._load_trusted_addresses(),
+                )
 
 
 class FileModeTest(unittest.TestCase):
@@ -180,11 +193,17 @@ class FileModeTest(unittest.TestCase):
 
     def test_credential_files_are_0600_and_dir_0700(self):
         main._save_ssh_settings({"host": "h"})
-        main._save_trusted_addresses([{"host": "h", "source_cidr": None}])
+        main._save_trusted_addresses([{"host": "h"}])
+        main._save_bridge_language("zh")
         main._write_inline_key("key-material")
         root = Path(self.temp_dir.name)
         self.assertEqual(0o700, stat.S_IMODE(root.stat().st_mode))
-        for name in ("ssh_settings.json", "trusted_addresses.json", "ssh_key"):
+        for name in (
+            "ssh_settings.json",
+            "trusted_addresses.json",
+            "bridge_settings.json",
+            "ssh_key",
+        ):
             self.assertEqual(
                 0o600,
                 stat.S_IMODE((root / name).stat().st_mode),

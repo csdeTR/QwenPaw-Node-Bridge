@@ -402,7 +402,7 @@ class BrowserTest(unittest.TestCase):
         manifest = json.loads(
             (ROOT_DIR / "plugin.json").read_text(encoding="utf-8"),
         )
-        self.assertEqual(manifest["version"], "0.5.1")
+        self.assertEqual(manifest["version"], "0.5.2")
         self.assertIn("browser", manifest["meta"]["capabilities"])
         self.assertEqual(
             tuple(manifest["meta"]["capabilities"]),
